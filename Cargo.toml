@@ -3,6 +3,7 @@ name = "engineering-challenge"
 version = "0.1.0"
 edition = "2024"
 build = "src/util/build.rs"
+default-run = "collector"
 
 [dependencies]
 anyhow = "1"

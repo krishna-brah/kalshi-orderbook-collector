@@ -56,9 +56,6 @@ async fn snapshots(
         let v: Value = serde_json::from_str(&text)?;
         match v["type"].as_str() {
             Some("orderbook_snapshot") => {
-                if books.len() < 2 {
-                    eprintln!("yes_price={yes_price}: {}", &text[..text.len().min(400)]);
-                }
                 let mut no = Levels::new();
                 for level in v["msg"]["no_dollars_fp"].as_array().into_iter().flatten() {
                     no.insert(

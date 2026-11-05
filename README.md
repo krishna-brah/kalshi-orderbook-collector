@@ -211,6 +211,10 @@ is scheduled to change.
 
 ## Limits and next steps
 
+- **Every live number here is from Kalshi's demo environment.** Production
+  (`--env prod`, the default) runs the same code with the same message
+  formats, auth and two-host layout, but it has not been run against
+  production yet.
 - Timestamps come from the wall clock. On the laptop used here it ran 70–90 ms
   slow (`sntp`). A real capture belongs on a host with a disciplined clock
   (chrony, or AWS Time Sync on EC2) near Kalshi; production's load balancer is
