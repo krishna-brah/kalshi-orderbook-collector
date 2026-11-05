@@ -406,11 +406,11 @@ impl ShardCore {
                         side,
                         symbol: symbol.clone(),
                     }));
-                    if let (Some(lag), Some(clock)) = (market.lag, msg.clock) {
-                        if clock >= lag.clock {
-                            market.lag = None;
-                            lagging.remove(symbol);
-                        }
+                    if let (Some(lag), Some(clock)) = (market.lag, msg.clock)
+                        && clock >= lag.clock
+                    {
+                        market.lag = None;
+                        lagging.remove(symbol);
                     }
                 } else if let (Some(source), Some(clock)) = (market.source, msg.clock) {
                     let source_view = &market.views[source];
@@ -994,11 +994,11 @@ async fn run<V: Venue>(
                 core.check_lags(Instant::now(), now_micros());
             }
             _ = probe_timer.tick() => {
-                for slot in 0..cfg.redundancy {
+                for (slot, conn) in conns.iter().enumerate() {
                     if core.is_up(slot) {
                         let picked = core.pick_probes(slot, cfg.probe_batch);
                         if !picked.is_empty() {
-                            let _ = conns[slot].cmds.send(ConnCmd::Snapshots(picked));
+                            let _ = conn.cmds.send(ConnCmd::Snapshots(picked));
                         }
                     }
                 }

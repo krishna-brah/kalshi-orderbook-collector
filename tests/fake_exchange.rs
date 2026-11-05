@@ -2,6 +2,9 @@
 //! one of the two sockets in the ways the challenge describes. Whatever goes
 //! wrong, the output file must replay to exactly the exchange's final books.
 
+// tungstenite's handshake callback returns its own (large) error type.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,11 +45,13 @@ struct Change {
     ts_ms: i64,
 }
 
+/// YES bids and NO bids, price in cents to contracts.
+type Sides = (BTreeMap<i64, i64>, BTreeMap<i64, i64>);
+
 #[derive(Default)]
 struct Exchange {
     clock: u64,
-    /// Per market: YES bids and NO bids, price in cents to contracts.
-    books: BTreeMap<String, (BTreeMap<i64, i64>, BTreeMap<i64, i64>)>,
+    books: BTreeMap<String, Sides>,
     last_clock: HashMap<String, u64>,
 }
 

@@ -141,10 +141,10 @@ async fn main() -> Result<()> {
             delays.push(recv_ms - sending);
         }
         if let Some(seq) = v["seq"].as_u64() {
-            if let Some(prev) = last_seq {
-                if seq != prev + 1 {
-                    gaps += 1;
-                }
+            if let Some(prev) = last_seq
+                && seq != prev + 1
+            {
+                gaps += 1;
             }
             last_seq = Some(seq);
         }

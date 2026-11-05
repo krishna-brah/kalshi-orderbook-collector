@@ -286,8 +286,8 @@ impl Venue for Polymarket {
         }
     }
 
-    fn confirm_market(&self, _market: String) -> impl Future<Output = anyhow::Result<bool>> + Send {
-        async { Ok(true) }
+    async fn confirm_market(&self, _market: String) -> anyhow::Result<bool> {
+        Ok(true)
     }
 }
 

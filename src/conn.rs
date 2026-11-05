@@ -328,11 +328,12 @@ impl<V: Venue> Conn<V> {
         let mut frames = Vec::new();
 
         loop {
-            if session.in_flight.is_none() && Instant::now() >= session.not_before {
-                if let Some(command) = session.queue.pop_front() {
-                    self.send(&mut sink, &mut session, command).await?;
-                    continue;
-                }
+            if session.in_flight.is_none()
+                && Instant::now() >= session.not_before
+                && let Some(command) = session.queue.pop_front()
+            {
+                self.send(&mut sink, &mut session, command).await?;
+                continue;
             }
             tokio::select! {
                 biased;
@@ -383,11 +384,10 @@ impl<V: Venue> Conn<V> {
                     if last_frame.elapsed() > SILENCE_LIMIT {
                         bail!("no frames for {:?}", last_frame.elapsed());
                     }
-                    if let Some(in_flight) = &session.in_flight {
-                        if in_flight.sent.elapsed() > COMMAND_TIMEOUT {
+                    if let Some(in_flight) = &session.in_flight
+                        && in_flight.sent.elapsed() > COMMAND_TIMEOUT {
                             bail!("command {} unanswered for {:?}", in_flight.id, in_flight.sent.elapsed());
                         }
-                    }
                 }
                 _ = keepalive_timer.tick(), if keepalive.is_some() => {
                     sink.send(Message::text(keepalive.map_or("", |k| k.1))).await?;
@@ -460,13 +460,12 @@ impl<V: Venue> Conn<V> {
         received: Micros,
         session: &mut Session,
     ) -> anyhow::Result<()> {
-        if let Some((sid, seq)) = frame.seq {
-            if let Some(previous) = session.seqs.insert(sid, seq) {
-                if seq != previous + 1 {
-                    tracing::warn!(conn = %self.spec.label, sid, previous, seq, "sequence gap");
-                    self.lost_data(session)?;
-                }
-            }
+        if let Some((sid, seq)) = frame.seq
+            && let Some(previous) = session.seqs.insert(sid, seq)
+            && seq != previous + 1
+        {
+            tracing::warn!(conn = %self.spec.label, sid, previous, seq, "sequence gap");
+            self.lost_data(session)?;
         }
         match frame.msg {
             Decoded::Book(msg) => {
