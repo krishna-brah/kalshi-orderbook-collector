@@ -49,18 +49,24 @@ struct Exchange {
 }
 
 impl Exchange {
+    /// Kalshi with `use_yes_price`: NO bids are reported at the YES price.
     fn snapshot_frame(&self, market: &str, seq: u64) -> String {
         let empty = (BTreeMap::new(), BTreeMap::new());
         let (yes, no) = self.books.get(market).unwrap_or(&empty);
-        let levels = |side: &BTreeMap<i64, i64>| -> Vec<Value> {
-            side.iter().map(|(c, q)| json!([format!("0.{c:02}00"), format!("{q}.00")])).collect()
+        let levels = |side: &BTreeMap<i64, i64>, yes_leg: bool| -> Vec<Value> {
+            side.iter()
+                .map(|(&c, q)| {
+                    let c = if yes_leg { c } else { 100 - c };
+                    json!([format!("0.{c:02}00"), format!("{q}.00")])
+                })
+                .collect()
         };
         json!({
             "type": "orderbook_snapshot", "sid": 1, "seq": seq, "sending_ts_ms": now_ms(),
             "msg": {
                 "market_ticker": market, "market_id": "x",
                 "clock": self.last_clock.get(market).copied().unwrap_or(0),
-                "yes_dollars_fp": levels(yes), "no_dollars_fp": levels(no),
+                "yes_dollars_fp": levels(yes, true), "no_dollars_fp": levels(no, false),
             }
         })
         .to_string()
@@ -85,11 +91,12 @@ fn now_ms() -> i64 {
 }
 
 fn delta_frame(change: &Change, seq: u64) -> String {
+    let cents = if change.yes { change.cents } else { 100 - change.cents };
     json!({
         "type": "orderbook_delta", "sid": 1, "seq": seq, "sending_ts_ms": now_ms(),
         "msg": {
             "market_ticker": change.market, "market_id": "x", "clock": change.clock,
-            "price_dollars": format!("0.{:02}00", change.cents), "delta_fp": format!("{}.00", change.delta),
+            "price_dollars": format!("0.{cents:02}00"), "delta_fp": format!("{}.00", change.delta),
             "side": if change.yes { "yes" } else { "no" }, "ts_ms": change.ts_ms,
         }
     })
@@ -138,6 +145,8 @@ struct Faults {
     mute: Option<(&'static str, usize)>,
     /// Deliver every frame this much later than the other route.
     delay: Option<Duration>,
+    /// Answer the first subscribe with Kalshi's transient "command timeout".
+    refuse_first_subscribe: bool,
 }
 
 async fn serve(
@@ -170,22 +179,11 @@ async fn serve(
             }
         }
     });
-    // Only book changes are delayed, so the route still wins the first
-    // snapshots and starts as the source.
-    let delay = faults.delay.unwrap_or_default();
-    let send = |text: String| {
-        let _ = out_tx.send((Instant::now(), text));
-    };
-    let send_late = |text: String| {
-        let _ = out_tx.send((Instant::now() + delay, text));
-    };
-
     if let Some(wait) = faults.slow_start {
         tokio::time::sleep(wait).await;
     }
-    let mut subscribed: HashMap<String, u64> = HashMap::new();
-    let mut seq = 0u64;
-    let mut forwarded = 0usize;
+    let mut feed = Feed { out: out_tx, faults, subscribed: HashMap::new(), seq: 0, forwarded: 0 };
+    let mut refused_once = false;
     loop {
         tokio::select! {
             command = commands.next() => {
@@ -198,47 +196,94 @@ async fn serve(
                 let action = cmd["params"]["action"].as_str().unwrap_or("");
                 match (cmd["cmd"].as_str().unwrap_or(""), action) {
                     ("subscribe", _) => {
-                        send(json!({"id": id, "type": "subscribed", "msg": {"channel": "orderbook_delta", "sid": 1}}).to_string());
+                        assert_eq!(cmd["params"]["use_yes_price"], true, "frames below assume yes-leg pricing");
+                        if feed.faults.refuse_first_subscribe && !refused_once {
+                            refused_once = true;
+                            feed.send(json!({"id": id, "type": "error", "msg": {"code": 18, "msg": "Command timeout"}}).to_string());
+                            continue;
+                        }
+                        feed.send(json!({"id": id, "type": "subscribed", "msg": {"channel": "orderbook_delta", "sid": 1}}).to_string());
                     }
-                    ("update_subscription", "add_markets") => send(json!({"id": id, "type": "ok", "sid": 1}).to_string()),
+                    ("update_subscription", "add_markets") => feed.send(json!({"id": id, "type": "ok", "sid": 1}).to_string()),
                     ("update_subscription", "delete_markets") => {
                         for m in &markets {
-                            subscribed.remove(m);
+                            feed.subscribed.remove(m);
                         }
                         continue;
                     }
                     ("update_subscription", "get_snapshot") => {}
                     other => panic!("unexpected command {other:?}"),
                 }
+                // Like Kalshi: every change broadcast before this snapshot
+                // goes out on this socket before it. Holding the lock stops
+                // new changes while the backlog is flushed.
                 let ex = exchange.lock().unwrap();
+                loop {
+                    match changes.try_recv() {
+                        Ok(change) => {
+                            if !feed.forward(change) {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(error) => panic!("test broadcast failed: {error}"),
+                    }
+                }
                 for market in markets {
-                    seq += 1;
-                    send(ex.snapshot_frame(&market, seq));
-                    subscribed.insert(market.clone(), ex.last_clock.get(&market).copied().unwrap_or(0));
+                    feed.seq += 1;
+                    feed.send(ex.snapshot_frame(&market, feed.seq));
+                    feed.subscribed.insert(market.clone(), ex.last_clock.get(&market).copied().unwrap_or(0));
                 }
             }
             change = changes.recv() => {
-                let change = change.expect("test broadcast should not lag");
-                let Some(&from) = subscribed.get(&change.market) else { continue };
-                if change.clock <= from {
-                    continue; // already in the snapshot this socket sent
-                }
-                let index = forwarded;
-                forwarded += 1;
-                if faults.drop_after == Some(index) {
+                if !feed.forward(change.expect("test broadcast should not lag")) {
                     return;
                 }
-                if faults.lose_at == Some(index) {
-                    seq += 1;
-                    continue;
-                }
-                if faults.mute.is_some_and(|(m, after)| m == change.market && index >= after) {
-                    continue;
-                }
-                seq += 1;
-                send_late(delta_frame(&change, seq));
             }
         }
+    }
+}
+
+/// One socket's outgoing stream: which markets it carries, its sequence
+/// numbers, and the faults it injects.
+struct Feed {
+    out: mpsc::UnboundedSender<(Instant, String)>,
+    faults: Faults,
+    /// Market to the clock of the snapshot this socket sent for it.
+    subscribed: HashMap<String, u64>,
+    seq: u64,
+    forwarded: usize,
+}
+
+impl Feed {
+    fn send(&self, text: String) {
+        let _ = self.out.send((Instant::now(), text));
+    }
+
+    /// Sends a change if this socket carries its market. Only book changes
+    /// are delayed, so a delayed route still wins the first snapshots and
+    /// starts as the source. Returns false when the socket should drop.
+    fn forward(&mut self, change: Change) -> bool {
+        let Some(&from) = self.subscribed.get(&change.market) else { return true };
+        if change.clock <= from {
+            return true; // already in the snapshot this socket sent
+        }
+        let index = self.forwarded;
+        self.forwarded += 1;
+        if self.faults.drop_after == Some(index) {
+            return false;
+        }
+        if self.faults.lose_at == Some(index) {
+            self.seq += 1;
+            return true;
+        }
+        if self.faults.mute.is_some_and(|(m, after)| m == change.market && index >= after) {
+            return true;
+        }
+        self.seq += 1;
+        let due = Instant::now() + self.faults.delay.unwrap_or_default();
+        let _ = self.out.send((due, delta_frame(&change, self.seq)));
+        true
     }
 }
 
@@ -442,6 +487,16 @@ async fn a_market_that_goes_quiet_on_one_socket_moves_and_is_resubscribed() {
     assert!(outcome.stats.snapshots_out_lag.get() >= 1, "MKT-B switched to the copy that kept changing");
     assert!(outcome.stats.quiet_resubscribes.get() >= 1, "the quiet copy was resubscribed");
     assert_eq!(outcome.stats.gaps.get(), 0, "no sequence gap: only the cross-copy check could catch this");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transient_refusal_is_retried_not_forgotten() {
+    let a = Faults { refuse_first_subscribe: true, ..Faults::default() };
+    let outcome = run(faults(a), Duration::from_millis(200), Duration::from_secs(30), 400).await;
+    assert_exact(&outcome);
+    assert_eq!(outcome.stats.refused.get(), 0, "a timeout is retried, not treated as a bad ticker");
+    let (probes, mismatches) = (outcome.stats.probes.get(), outcome.stats.probe_mismatches.get());
+    assert!(probes > 0 && mismatches == 0, "probes {probes}, mismatches {mismatches}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

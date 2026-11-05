@@ -161,6 +161,8 @@ async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize)
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut collector = tokio::spawn(collector::run(venue, config, writer.tx.clone(), stats.clone(), shutdown_rx));
+    // Registered once, so a signal arriving between loop iterations isn't lost.
+    let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut status = tokio::time::interval(Duration::from_secs(args.stats_secs.max(1)));
     status.tick().await;
@@ -168,7 +170,7 @@ async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize)
     let mut failed = false;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 tracing::info!("SIGINT: closing sockets and the output file");
                 break;
             }

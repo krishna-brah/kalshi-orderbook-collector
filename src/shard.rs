@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::book::Book;
-use crate::conn::{self, ConnCmd, ConnEventKind, ConnHandle, ConnSpec, Mode};
+use crate::conn::{self, ConnCmd, ConnEvent, ConnEventKind, ConnHandle, ConnSpec, Mode};
 use crate::model::{BookBody, BookMsg, Micros, now_micros, to_datetime};
 use crate::stats::Stats;
 use crate::util::dtos::challenge_orderbook::{
@@ -35,6 +35,10 @@ use crate::writer::OutMsg;
 
 /// How many recent changes per market to remember for the arrival race.
 const ARRIVALS_KEPT: usize = 16;
+/// How long a copy may stay unusable on a live socket before it is
+/// re-requested, and how long between further attempts.
+const REPAIR_AFTER: Duration = Duration::from_secs(15);
+const REPAIR_RETRY: Duration = Duration::from_secs(30);
 /// A market counts as active if it changed at least this often in the last
 /// activity window.
 const ACTIVE_UPDATES: u32 = 10;
@@ -82,6 +86,14 @@ struct View {
     /// clock) than this one.
     behind_since: Option<Instant>,
     probe_pending: bool,
+    /// Since when the repair sweep has seen this copy unusable.
+    invalid_since: Option<Instant>,
+    /// 0: not asked yet; 1: snapshot requested; 2: resubscribed.
+    repair_stage: u8,
+    repair_at: Option<Instant>,
+    /// The venue refused this market on this socket; the next connection
+    /// retries it, not the repair sweep.
+    refused: bool,
 }
 
 impl View {
@@ -94,7 +106,18 @@ impl View {
             last_delta: None,
             behind_since: None,
             probe_pending: false,
+            invalid_since: None,
+            repair_stage: 0,
+            repair_at: None,
+            refused: false,
         }
+    }
+
+    fn repaired(&mut self) {
+        self.invalid_since = None;
+        self.repair_stage = 0;
+        self.repair_at = None;
+        self.refused = false;
     }
 }
 
@@ -122,6 +145,9 @@ struct Market {
     updates_this_window: u32,
     updates_last_window: u32,
     last_quiet_probe: Option<Instant>,
+    /// The latest timestamp written for this market. Nothing later in the
+    /// file is stamped earlier (see [`stamp`]).
+    last_out: Micros,
 }
 
 impl Market {
@@ -134,6 +160,7 @@ impl Market {
             updates_this_window: 0,
             updates_last_window: 0,
             last_quiet_probe: None,
+            last_out: 0,
         }
     }
 }
@@ -144,6 +171,8 @@ pub struct ShardCore {
     redundancy: usize,
     lag_threshold: Duration,
     quiet_after: Duration,
+    /// Whether the venue can re-send a snapshot in place (`get_snapshot`).
+    can_probe: bool,
     markets: IndexMap<String, Market>,
     lagging: HashSet<String>,
     up: Vec<bool>,
@@ -153,11 +182,18 @@ pub struct ShardCore {
 }
 
 impl ShardCore {
-    pub fn new(redundancy: usize, lag_threshold: Duration, quiet_after: Duration, stats: Arc<Stats>) -> Self {
+    pub fn new(
+        redundancy: usize,
+        lag_threshold: Duration,
+        quiet_after: Duration,
+        can_probe: bool,
+        stats: Arc<Stats>,
+    ) -> Self {
         Self {
             redundancy,
             lag_threshold,
             quiet_after,
+            can_probe,
             markets: IndexMap::new(),
             lagging: HashSet::new(),
             up: vec![false; redundancy],
@@ -205,8 +241,12 @@ impl ShardCore {
             .collect()
     }
 
+    /// A fresh socket resubscribes everything, so repairs start over.
     pub fn conn_up(&mut self, slot: usize) {
         self.up[slot] = true;
+        for market in self.markets.values_mut() {
+            market.views[slot].repaired();
+        }
     }
 
     /// The socket in `slot` went down (`down`) or lost frames: every copy it
@@ -230,7 +270,9 @@ impl ShardCore {
         }
     }
 
-    pub fn on_book(&mut self, slot: usize, received: Micros, now: Instant, msg: BookMsg) {
+    /// Book data from the socket in `slot`: `received` is when the frame came
+    /// off the socket, `sent` when the venue says it sent it.
+    pub fn on_book(&mut self, slot: usize, received: Micros, sent: Option<Micros>, now: Instant, msg: BookMsg) {
         let Self { markets, lagging, out, cmds, stats, .. } = self;
         let Some((_, symbol, market)) = markets.get_full_mut(&msg.market) else {
             return; // removed while frames were in flight
@@ -252,19 +294,24 @@ impl ShardCore {
                 let changed = !view.valid || view.book != book;
                 view.book = book;
                 view.valid = true;
+                view.repaired();
                 view.clock = msg.clock.unwrap_or(view.clock);
-                view.exchange_ts = msg.exchange_ts.or(view.exchange_ts);
+                // A snapshot has no change time of its own; the venue's send
+                // stamp is the time of the state it shows.
+                view.exchange_ts = msg.exchange_ts.or(sent).or(view.exchange_ts);
                 refresh_behind(market, now);
                 match market.source {
                     Some(source) if source == slot => {
                         if changed {
-                            emit_snapshot(out, stats, symbol, &market.views[slot], received, SnapshotReason::Exchange);
+                            let view = &market.views[slot];
+                            emit_snapshot(out, stats, symbol, view, &mut market.last_out, received, SnapshotReason::Exchange);
                         }
                     }
                     Some(source) if market.views[source].valid => {}
                     _ => {
                         market.source = Some(slot);
-                        emit_snapshot(out, stats, symbol, &market.views[slot], received, SnapshotReason::Exchange);
+                        let view = &market.views[slot];
+                        emit_snapshot(out, stats, symbol, view, &mut market.last_out, received, SnapshotReason::Exchange);
                     }
                 }
             }
@@ -300,8 +347,9 @@ impl ShardCore {
                 if market.source == Some(slot) {
                     market.updates_this_window += 1;
                     stats.updates_out.inc();
+                    let at = stamp(&mut market.last_out, received, stats);
                     out.push(OutMsg::Update(PriceLevelUpdateDomain {
-                        backtest_timestamp: to_datetime(received),
+                        backtest_timestamp: to_datetime(at),
                         exchange_timestamp: to_datetime(market.views[slot].exchange_ts.unwrap_or(received)),
                         price_level: price,
                         quantity,
@@ -348,7 +396,8 @@ impl ShardCore {
                 tracing::info!(market = %symbol, from = ?market.source, to = lag.slot,
                     "source fell behind another copy; switching");
                 market.source = Some(lag.slot);
-                emit_snapshot(&mut self.out, &self.stats, &symbol, &market.views[lag.slot], now_us, SnapshotReason::Lag);
+                let view = &market.views[lag.slot];
+                emit_snapshot(&mut self.out, &self.stats, &symbol, view, &mut market.last_out, now_us, SnapshotReason::Lag);
             }
         }
     }
@@ -356,10 +405,11 @@ impl ShardCore {
     /// The minute snapshot: every book with a usable source copy.
     pub fn snapshot_all(&mut self, now: Micros) {
         let Self { markets, out, stats, .. } = self;
-        for (symbol, market) in markets.iter() {
+        for (symbol, market) in markets.iter_mut() {
             match market.source {
                 Some(source) if market.views[source].valid => {
-                    emit_snapshot(out, stats, symbol, &market.views[source], now, SnapshotReason::Periodic);
+                    let view = &market.views[source];
+                    emit_snapshot(out, stats, symbol, view, &mut market.last_out, now, SnapshotReason::Periodic);
                 }
                 _ => stats.uncovered.inc(),
             }
@@ -370,7 +420,7 @@ impl ShardCore {
     /// a fresh venue snapshot.
     pub fn pick_probes(&mut self, slot: usize, n: usize) -> Vec<String> {
         let mut picked = Vec::new();
-        if self.markets.is_empty() {
+        if self.markets.is_empty() || !self.can_probe {
             return picked;
         }
         for _ in 0..n * 4 {
@@ -397,7 +447,7 @@ impl ShardCore {
     /// - An active market whose copies have all gone silent is probed; if it
     ///   is just quiet the probe matches and nothing changes.
     pub fn check_quiet(&mut self, now: Instant, now_us: Micros) {
-        let Self { markets, up, out, cmds, stats, quiet_after, lagging, redundancy, .. } = self;
+        let Self { markets, up, out, cmds, stats, quiet_after, lagging, redundancy, can_probe, .. } = self;
         let quiet_after = *quiet_after;
         let mut quiet: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
         let mut probes: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
@@ -415,7 +465,7 @@ impl ShardCore {
             let silent = now.duration_since(newest) > quiet_after;
             let was_active = market.updates_last_window >= ACTIVE_UPDATES;
             let probed_recently = market.last_quiet_probe.is_some_and(|t| now.duration_since(t) < quiet_after);
-            if !any_quiet && silent && was_active && !probed_recently {
+            if *can_probe && !any_quiet && silent && was_active && !probed_recently {
                 market.last_quiet_probe = Some(now);
                 for slot in 0..market.views.len() {
                     let view = &mut market.views[slot];
@@ -479,15 +529,71 @@ impl ShardCore {
         valid as f64 / self.markets.len() as f64
     }
 
-    /// The venue refused these markets on `slot`; forget that copy.
+    /// The venue refused these markets on `slot`. That copy is unusable until
+    /// the socket reconnects (which retries them); the repair sweep leaves it.
     pub fn refused(&mut self, slot: usize, markets: &[String], now: Micros) {
         let Self { markets: tracked, out, stats, .. } = self;
         for symbol in markets {
             if let Some(market) = tracked.get_mut(symbol) {
                 market.views[slot].valid = false;
+                market.views[slot].refused = true;
                 if market.source == Some(slot) {
                     reselect(symbol, market, now, out, stats);
                 }
+            }
+        }
+    }
+
+    /// Re-requests copies that stayed unusable on a live socket, whatever the
+    /// reason: a snapshot request that was refused or lost, a market added
+    /// but never confirmed. First a snapshot request (where the venue has
+    /// one), then a resubscribe, repeated every [`REPAIR_RETRY`]. If most of
+    /// a socket needs repair, the socket is reconnected instead.
+    pub fn check_repairs(&mut self, now: Instant) {
+        let Self { markets, up, cmds, stats, redundancy, can_probe, .. } = self;
+        let mut snapshots: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
+        let mut resubscribe: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
+        for (symbol, market) in markets.iter_mut() {
+            for slot in 0..market.views.len() {
+                let view = &mut market.views[slot];
+                if !up[slot] || view.valid || view.refused {
+                    continue;
+                }
+                let since = *view.invalid_since.get_or_insert(now);
+                let last = view.repair_at.unwrap_or(since);
+                let wait = if view.repair_stage == 0 { REPAIR_AFTER } else { REPAIR_RETRY };
+                if now.duration_since(last) < wait {
+                    continue;
+                }
+                if view.repair_stage == 0 && *can_probe {
+                    snapshots[slot].push(symbol.clone());
+                    view.repair_stage = 1;
+                } else {
+                    resubscribe[slot].push(symbol.clone());
+                    view.repair_stage = 2;
+                }
+                view.repair_at = Some(now);
+            }
+        }
+        let socket_limit = (markets.len() / 10).max(50);
+        for slot in 0..*redundancy {
+            let count = snapshots[slot].len() + resubscribe[slot].len();
+            if count == 0 {
+                continue;
+            }
+            if count > socket_limit {
+                stats.repair_reconnects.inc();
+                tracing::warn!(slot, count, "most of this socket's copies stayed unusable; reconnecting it");
+                cmds.push((slot, ConnCmd::Reconnect));
+                continue;
+            }
+            stats.repairs.add(count as u64);
+            tracing::info!(slot, count, "re-requesting copies that stayed unusable");
+            if !snapshots[slot].is_empty() {
+                cmds.push((slot, ConnCmd::Snapshots(std::mem::take(&mut snapshots[slot]))));
+            }
+            if !resubscribe[slot].is_empty() {
+                cmds.push((slot, ConnCmd::Resubscribe(std::mem::take(&mut resubscribe[slot]))));
             }
         }
     }
@@ -502,9 +608,25 @@ fn reselect(symbol: &str, market: &mut Market, now: Micros, out: &mut Vec<OutMsg
     market.source = best;
     market.lag = None;
     match best {
-        Some(slot) => emit_snapshot(out, stats, symbol, &market.views[slot], now, SnapshotReason::Failover),
+        Some(slot) => {
+            let view = &market.views[slot];
+            emit_snapshot(out, stats, symbol, view, &mut market.last_out, now, SnapshotReason::Failover);
+        }
         None => stats.uncovered.inc(),
     }
+}
+
+/// The timestamp to write for a market: `at`, unless something later was
+/// already written for it. A frame received before a snapshot we generated
+/// can be processed just after it; stamping it earlier than the snapshot
+/// would put the file's per-market timestamps out of order.
+fn stamp(last_out: &mut Micros, at: Micros, stats: &Stats) -> Micros {
+    if at < *last_out {
+        stats.stamp_clamps.inc();
+        return *last_out;
+    }
+    *last_out = at;
+    at
 }
 
 /// Marks which usable copies trail the newest clock any copy has seen.
@@ -542,13 +664,22 @@ fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats)
     }
 }
 
-fn emit_snapshot(out: &mut Vec<OutMsg>, stats: &Stats, symbol: &str, view: &View, at: Micros, reason: SnapshotReason) {
+fn emit_snapshot(
+    out: &mut Vec<OutMsg>,
+    stats: &Stats,
+    symbol: &str,
+    view: &View,
+    last_out: &mut Micros,
+    at: Micros,
+    reason: SnapshotReason,
+) {
     match reason {
         SnapshotReason::Exchange => stats.snapshots_out_exchange.inc(),
         SnapshotReason::Failover => stats.snapshots_out_failover.inc(),
         SnapshotReason::Lag => stats.snapshots_out_lag.inc(),
         SnapshotReason::Periodic => stats.snapshots_out_periodic.inc(),
     }
+    let at = stamp(last_out, at, stats);
     out.push(OutMsg::Snapshot(SnapshotDomain {
         received_at: to_datetime(at),
         exchange_timestamp: to_datetime(view.exchange_ts.unwrap_or(at)),
@@ -606,8 +737,27 @@ async fn run<V: Venue>(
     drop(events_tx);
     stats.sockets.add(cfg.redundancy as i64);
 
-    let mut core = ShardCore::new(cfg.redundancy, cfg.lag_threshold, cfg.quiet_after, stats.clone());
+    let mut core =
+        ShardCore::new(cfg.redundancy, cfg.lag_threshold, cfg.quiet_after, venue.snapshots_in_place(), stats.clone());
     let mut next_recycle: Vec<Option<Instant>> = vec![None; cfg.redundancy];
+    let handle = |core: &mut ShardCore, next_recycle: &mut Vec<Option<Instant>>, event: ConnEvent| match event.kind {
+        ConnEventKind::Up => {
+            core.conn_up(event.slot);
+            next_recycle[event.slot] = cfg.recycle_every.map(|p| Instant::now() + jittered(p));
+        }
+        ConnEventKind::Down { .. } => core.conn_lost(event.slot, true, now_micros()),
+        ConnEventKind::Gap => core.conn_lost(event.slot, false, now_micros()),
+        ConnEventKind::Book { received, sent, msg } => core.on_book(event.slot, received, sent, Instant::now(), msg),
+        ConnEventKind::Refused { markets, .. } => core.refused(event.slot, &markets, now_micros()),
+        ConnEventKind::Lifecycle(_) => {}
+    };
+    // Frames already received are applied before anything time-driven
+    // (minute snapshot, lag switch), so what that writes includes them.
+    let drain = |core: &mut ShardCore, next_recycle: &mut Vec<Option<Instant>>, events: &mut mpsc::UnboundedReceiver<ConnEvent>| {
+        while let Ok(event) = events.try_recv() {
+            handle(core, next_recycle, event);
+        }
+    };
     let mut lag_timer = tokio::time::interval(Duration::from_millis(100));
     let mut probe_timer = tokio::time::interval(cfg.probe_every);
     let mut quiet_timer =
@@ -635,21 +785,17 @@ async fn run<V: Venue>(
                         }
                     }
                 }
-                Some(ShardCmd::SnapshotAll) => core.snapshot_all(now_micros()),
+                Some(ShardCmd::SnapshotAll) => {
+                    drain(&mut core, &mut next_recycle, &mut events);
+                    core.snapshot_all(now_micros());
+                }
                 None => break,
             },
-            Some(event) = events.recv() => match event.kind {
-                ConnEventKind::Up => {
-                    core.conn_up(event.slot);
-                    next_recycle[event.slot] = cfg.recycle_every.map(|p| Instant::now() + jittered(p));
-                }
-                ConnEventKind::Down { .. } => core.conn_lost(event.slot, true, now_micros()),
-                ConnEventKind::Gap => core.conn_lost(event.slot, false, now_micros()),
-                ConnEventKind::Book { received, msg } => core.on_book(event.slot, received, Instant::now(), msg),
-                ConnEventKind::Refused { markets, .. } => core.refused(event.slot, &markets, now_micros()),
-                ConnEventKind::Lifecycle(_) => {}
-            },
-            _ = lag_timer.tick() => core.check_lags(Instant::now(), now_micros()),
+            Some(event) = events.recv() => handle(&mut core, &mut next_recycle, event),
+            _ = lag_timer.tick() => {
+                drain(&mut core, &mut next_recycle, &mut events);
+                core.check_lags(Instant::now(), now_micros());
+            }
             _ = probe_timer.tick() => {
                 for slot in 0..cfg.redundancy {
                     if core.is_up(slot) {
@@ -660,7 +806,11 @@ async fn run<V: Venue>(
                     }
                 }
             }
-            _ = quiet_timer.tick() => core.check_quiet(Instant::now(), now_micros()),
+            _ = quiet_timer.tick() => {
+                drain(&mut core, &mut next_recycle, &mut events);
+                core.check_quiet(Instant::now(), now_micros());
+                core.check_repairs(Instant::now());
+            }
             _ = window_timer.tick() => core.roll_activity_window(),
             _ = recycle_timer.tick() => {
                 // Recycle one socket at a time, and only while every other
@@ -686,8 +836,14 @@ async fn run<V: Venue>(
             let _ = conns[slot].cmds.send(cmd);
         }
     }
+    // Shutting down: once the sockets have closed, apply and write whatever
+    // they had already received.
     for conn in conns {
         let _ = conn.task.await;
+    }
+    drain(&mut core, &mut next_recycle, &mut events);
+    for msg in core.out.drain(..) {
+        let _ = out.send(msg);
     }
     stats.sockets.add(-(cfg.redundancy as i64));
 }

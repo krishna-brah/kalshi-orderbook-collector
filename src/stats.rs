@@ -156,6 +156,11 @@ pub struct Stats {
     pub quiet_reconnects: Counter,
     pub rate_limited: Counter,
     pub server_closes: Counter,
+    pub repairs: Counter,
+    pub repair_reconnects: Counter,
+    /// Messages stamped later than received so a market's timestamps never
+    /// go backwards in the file.
+    pub stamp_clamps: Counter,
 
     pub listings: Counter,
     pub listing_failures: Counter,
@@ -197,6 +202,9 @@ impl Stats {
             quiet_reconnects: Counter::default(),
             rate_limited: Counter::default(),
             server_closes: Counter::default(),
+            repairs: Counter::default(),
+            repair_reconnects: Counter::default(),
+            stamp_clamps: Counter::default(),
             listings: Counter::default(),
             listing_failures: Counter::default(),
             lifecycle_opened: Counter::default(),
@@ -290,6 +298,9 @@ impl Stats {
             "quiet_socket_reconnects": self.quiet_reconnects.get(),
             "rate_limited_commands": self.rate_limited.get(),
             "closed_by_server": self.server_closes.get(),
+            "copies_repaired": self.repairs.get(),
+            "repair_socket_reconnects": self.repair_reconnects.get(),
+            "timestamps_held_back": self.stamp_clamps.get(),
             "listings": self.listings.get(),
             "listing_failures": self.listing_failures.get(),
             "lifecycle_opened": self.lifecycle_opened.get(),

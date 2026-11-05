@@ -194,10 +194,12 @@ pub async fn run<V: Venue>(
         tokio::time::Instant::now() + until_aligned(cfg.snapshot_every),
         cfg.snapshot_every,
     );
-    snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip keeps ticks on the wall-clock minute after a late one.
+    snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // A listing requested while one is running starts when that one ends.
+    let mut list_now = false;
     loop {
-        let mut list_now = false;
         tokio::select! {
             _ = shutdown.changed() => break,
             Some(msg) = listing_rx.recv() => match msg {
@@ -269,6 +271,7 @@ pub async fn run<V: Venue>(
             }
         }
         if list_now && listing.is_none() && discover {
+            list_now = false;
             listing_id += 1;
             listing = Some((listing_id, Instant::now(), HashSet::new()));
             start_listing(listing_id);

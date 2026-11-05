@@ -2,7 +2,12 @@
 //!
 //! Kalshi's book lists YES bids and NO bids. A NO bid at `p` is an offer to
 //! sell YES at `1 - p`, so we publish the YES contract's book: bids are YES
-//! bids and asks are `1 - p` for each NO bid.
+//! bids and asks are the NO bids at `1 - p`.
+//!
+//! We subscribe with `use_yes_price: true`, which makes Kalshi report NO bids
+//! already at `1 - p` (checked live: identical books either way). Kalshi has
+//! announced that this becomes the only behavior, so relying on it now means
+//! the default changing can't silently mirror our asks.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -185,7 +190,8 @@ struct LifecycleMsg<'a> {
     open_ts: Option<i64>,
 }
 
-/// A price in YES terms, checked to be strictly inside (0, 1).
+/// A level's side and YES-terms price, checked to be strictly inside (0, 1).
+/// With `use_yes_price`, a NO bid's price is already the YES ask's price.
 fn yes_level(side: &str, price: &str) -> anyhow::Result<(Side, i64)> {
     let price = fixed::parse(price)?;
     if price <= 0 || price >= SCALE {
@@ -193,7 +199,7 @@ fn yes_level(side: &str, price: &str) -> anyhow::Result<(Side, i64)> {
     }
     match side {
         "yes" => Ok((Side::Buy, price)),
-        "no" => Ok((Side::Sell, SCALE - price)),
+        "no" => Ok((Side::Sell, price)),
         other => bail!("unknown side {other:?}"),
     }
 }
@@ -287,7 +293,7 @@ impl Venue for Kalshi {
         json!({
             "id": req_id,
             "cmd": "subscribe",
-            "params": {"channels": ["orderbook_delta"], "market_tickers": markets},
+            "params": {"channels": ["orderbook_delta"], "market_tickers": markets, "use_yes_price": true},
         })
         .to_string()
     }
@@ -431,12 +437,21 @@ mod tests {
     }
 
     #[test]
+    fn subscribes_with_yes_leg_pricing() {
+        let text = venue().subscribe_books(1, &["A".into()]);
+        let cmd: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(cmd["params"]["use_yes_price"], true);
+        assert_eq!(cmd["params"]["channels"][0], "orderbook_delta");
+    }
+
+    #[test]
     fn snapshot_maps_no_bids_to_yes_asks() {
+        // With use_yes_price, a NO bid at 0.59 arrives as 0.41: the YES ask.
         let frame = decode_one(
             r#"{"type":"orderbook_snapshot","sid":1,"seq":1,"sending_ts_ms":1793899605589,
                 "msg":{"market_ticker":"KXTEST-1","market_id":"x","clock":2604399952,
                        "yes_dollars_fp":[["0.3900","100.00"],["0.0100","2.50"]],
-                       "no_dollars_fp":[["0.5900","100.00"]]}}"#,
+                       "no_dollars_fp":[["0.4100","100.00"]]}}"#,
         );
         assert_eq!(frame.seq, Some((1, 1)));
         assert_eq!(frame.sent_at, Some(1_793_899_605_589_000));
@@ -447,7 +462,6 @@ mod tests {
             book.body,
             BookBody::Snapshot {
                 bids: vec![(390_000, 100_000_000), (10_000, 2_500_000)],
-                // A NO bid at 0.59 is a YES offer at 0.41.
                 asks: vec![(410_000, 100_000_000)],
             }
         );
@@ -473,7 +487,7 @@ mod tests {
         assert_eq!(book.exchange_ts, Some(1_793_899_605_983_000));
         assert_eq!(
             book.body,
-            BookBody::Level { side: Side::Sell, price: 40_000, change: LevelChange::Delta(-54_000_000) }
+            BookBody::Level { side: Side::Sell, price: 960_000, change: LevelChange::Delta(-54_000_000) }
         );
     }
 

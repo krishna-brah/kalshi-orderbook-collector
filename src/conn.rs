@@ -25,13 +25,23 @@ use crate::venue::Venue;
 const SILENCE_LIMIT: Duration = Duration::from_secs(30);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(1);
+/// Wait before retrying a command, multiplied by the attempt number.
+const RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// Retryable errors in a row before the socket is reset.
+const MAX_RETRIES: u32 = 5;
 /// Spacing between commands the venue doesn't reply to.
 const UNACKED_COMMAND_GAP: Duration = Duration::from_millis(25);
-/// Kalshi error code for "the subscription exceeded its command rate limit".
-const ERROR_RATE_LIMITED: i64 = 27;
-/// Kalshi error code for "adding markets would exceed the per-subscription limit".
+/// How many un-acknowledged commands to remember, to recognise their errors.
+const UNACKED_KEPT: usize = 64;
+
+// Kalshi error codes the connection acts on.
+const ERROR_GENERAL: i64 = 1;
+const ERROR_UNKNOWN_SID: i64 = 7;
+const ERROR_CHANNEL: i64 = 10;
+const ERROR_COMMAND_TIMEOUT: i64 = 18;
+const ERROR_BUFFER_OVERFLOW: i64 = 25;
 const ERROR_MARKET_LIMIT: i64 = 26;
+const ERROR_RATE_LIMITED: i64 = 27;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -67,7 +77,9 @@ pub enum ConnEventKind {
     /// Frames were lost; every book this socket carries is suspect until it
     /// is snapshotted again. Fresh snapshots have already been requested.
     Gap,
-    Book { received: Micros, msg: BookMsg },
+    /// Book data, with when it came off the socket and when the venue says
+    /// it sent it.
+    Book { received: Micros, sent: Option<Micros>, msg: BookMsg },
     Lifecycle(Lifecycle),
     /// The venue would not subscribe these markets.
     Refused { markets: Vec<String>, code: i64, message: String },
@@ -131,6 +143,10 @@ struct Session {
     seqs: HashMap<u64, u64>,
     next_id: u64,
     not_before: Instant,
+    /// Retryable errors in a row; reset by any success.
+    retries: u32,
+    /// Ids of recent commands the venue doesn't acknowledge.
+    unacked: VecDeque<u64>,
 }
 
 struct Conn<V> {
@@ -250,6 +266,8 @@ impl<V: Venue> Conn<V> {
             seqs: HashMap::new(),
             next_id: 1,
             not_before: Instant::now(),
+            retries: 0,
+            unacked: VecDeque::new(),
         };
         match self.spec.mode {
             Mode::Books => {
@@ -370,6 +388,10 @@ impl<V: Venue> Conn<V> {
             session.in_flight = Some(InFlight { id, command, subscribe, sent: Instant::now() });
         } else {
             session.not_before = Instant::now() + UNACKED_COMMAND_GAP;
+            session.unacked.push_back(id);
+            if session.unacked.len() > UNACKED_KEPT {
+                session.unacked.pop_front();
+            }
         }
         Ok(())
     }
@@ -388,7 +410,7 @@ impl<V: Venue> Conn<V> {
                 if let Some(sent) = frame.sent_at {
                     self.stats.route(self.spec.slot).delay.record(received - sent);
                 }
-                self.emit(ConnEventKind::Book { received, msg });
+                self.emit(ConnEventKind::Book { received, sent: frame.sent_at, msg });
             }
             Decoded::Subscribed { req_id, sid } => {
                 if session.in_flight.as_ref().is_some_and(|f| f.id == req_id) {
@@ -396,19 +418,34 @@ impl<V: Venue> Conn<V> {
                     if in_flight.subscribe {
                         session.sid = Some(sid);
                     }
+                    session.retries = 0;
                 }
             }
             Decoded::Ack { req_id } => {
                 if session.in_flight.as_ref().is_some_and(|f| f.id == req_id) {
                     session.in_flight = None;
+                    session.retries = 0;
                 }
             }
             Decoded::Error { req_id, code, message } => {
-                let Some(in_flight) = session.in_flight.take_if(|f| Some(f.id) == req_id) else {
-                    tracing::warn!(conn = %self.spec.label, code, %message, "venue error");
+                // The subscription itself is gone; only a new connection
+                // (which resubscribes everything) can fix that.
+                if matches!(code, ERROR_UNKNOWN_SID | ERROR_BUFFER_OVERFLOW) {
+                    bail!("subscription broken (code {code}: {message})");
+                }
+                if let Some(in_flight) = session.in_flight.take_if(|f| Some(f.id) == req_id) {
+                    return self.command_failed(in_flight, code, message, session);
+                }
+                if req_id.is_some_and(|id| session.unacked.contains(&id)) {
+                    // A refused snapshot request or removal. Copies left
+                    // without a snapshot are re-requested by the shard.
+                    tracing::debug!(conn = %self.spec.label, code, %message, "command refused");
                     return Ok(());
-                };
-                self.command_failed(in_flight, code, message, session);
+                }
+                if code == ERROR_CHANNEL {
+                    bail!("channel error on the subscription (code {code}: {message})");
+                }
+                tracing::warn!(conn = %self.spec.label, code, %message, "venue error");
             }
             Decoded::Lifecycle(event) => self.emit(ConnEventKind::Lifecycle(event)),
             Decoded::Ignored => {}
@@ -416,17 +453,24 @@ impl<V: Venue> Conn<V> {
         Ok(())
     }
 
-    fn command_failed(&mut self, failed: InFlight, code: i64, message: String, session: &mut Session) {
+    fn command_failed(&mut self, failed: InFlight, code: i64, message: String, session: &mut Session) -> anyhow::Result<()> {
         if failed.subscribe {
             // Nothing is subscribed yet, so the retry must subscribe again.
             session.subscribe_sent = false;
         }
-        match failed.command {
-            _ if code == ERROR_RATE_LIMITED => {
-                self.stats.rate_limited.inc();
-                session.queue.push_front(failed.command);
-                session.not_before = Instant::now() + RATE_LIMIT_PAUSE;
+        if matches!(code, ERROR_RATE_LIMITED | ERROR_COMMAND_TIMEOUT | ERROR_GENERAL) {
+            session.retries += 1;
+            if session.retries > MAX_RETRIES {
+                bail!("{} retryable errors in a row (last: code {code}: {message})", session.retries);
             }
+            if code == ERROR_RATE_LIMITED {
+                self.stats.rate_limited.inc();
+            }
+            session.queue.push_front(failed.command);
+            session.not_before = Instant::now() + RETRY_PAUSE * session.retries;
+            return Ok(());
+        }
+        match failed.command {
             // One bad ticker fails a whole batch, so split until the bad ones
             // are isolated; a full subscription can't be fixed by splitting.
             Command::Add(markets) if markets.len() > 1 && code != ERROR_MARKET_LIMIT => {
@@ -435,20 +479,18 @@ impl<V: Venue> Conn<V> {
                 session.queue.push_front(Command::Add(left.to_vec()));
             }
             Command::Add(markets) => {
+                // The markets stay wanted: the next connection tries them
+                // again. Forgetting them would drop them for good.
                 tracing::warn!(conn = %self.spec.label, code, %message, count = markets.len(), first = %markets[0], "markets refused");
                 self.stats.refused.add(markets.len() as u64);
-                for market in &markets {
-                    self.desired.remove(market);
-                }
                 self.emit(ConnEventKind::Refused { markets, code, message });
             }
-            Command::Lifecycle => {
-                tracing::error!(conn = %self.spec.label, code, %message, "lifecycle subscription refused");
-            }
+            Command::Lifecycle => bail!("lifecycle subscription refused (code {code}: {message})"),
             Command::Remove(_) | Command::Snapshots(_) => {
                 tracing::debug!(conn = %self.spec.label, code, %message, "command refused");
             }
         }
+        Ok(())
     }
 
     /// Something was lost on this socket: tell the shard, then re-snapshot
