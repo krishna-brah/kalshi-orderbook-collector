@@ -38,7 +38,12 @@ pub trait Venue: Send + Sync + 'static {
     fn remove_markets(&self, req_id: u64, sid: Option<u64>, markets: &[String]) -> String;
 
     /// Ask for fresh snapshots of markets already subscribed, if the venue can.
-    fn request_snapshots(&self, req_id: u64, sid: Option<u64>, markets: &[String]) -> Option<String>;
+    fn request_snapshots(
+        &self,
+        req_id: u64,
+        sid: Option<u64>,
+        markets: &[String],
+    ) -> Option<String>;
 
     /// Whether `request_snapshots` works. Without it there are no audit
     /// probes, and a socket that lost data reconnects instead.

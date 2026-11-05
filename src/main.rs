@@ -97,16 +97,26 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run(args))
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(args.redundancy >= 1, "--redundancy must be at least 1");
     match args.venue {
         VenueName::Kalshi => {
-            let key_id = args.key_id.clone().context("Kalshi needs --key-id (or KALSHI_KEY_ID)")?;
-            let key_file = args.key_file.clone().context("Kalshi needs --key-file (or KALSHI_KEY_FILE)")?;
-            let pem = std::fs::read_to_string(&key_file).with_context(|| format!("reading {}", key_file.display()))?;
+            let key_id = args
+                .key_id
+                .clone()
+                .context("Kalshi needs --key-id (or KALSHI_KEY_ID)")?;
+            let key_file = args
+                .key_file
+                .clone()
+                .context("Kalshi needs --key-file (or KALSHI_KEY_FILE)")?;
+            let pem = std::fs::read_to_string(&key_file)
+                .with_context(|| format!("reading {}", key_file.display()))?;
             let mut venue = Kalshi::new(args.env, key_id, Signer::from_pem(&pem)?)?;
             if !args.ws_urls.is_empty() {
                 venue = venue.with_ws_urls(args.ws_urls.clone());
@@ -123,7 +133,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 }
 
-async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize) -> anyhow::Result<()> {
+async fn collect<V: Venue>(
+    venue: Arc<V>,
+    args: Args,
+    default_per_socket: usize,
+) -> anyhow::Result<()> {
     let stats = Arc::new(Stats::new(venue.ws_urls()));
     let writer = Writer::start(&args.out, stats.clone())?;
     let markets_per_socket = args.markets_per_socket.unwrap_or(default_per_socket);
@@ -153,14 +167,21 @@ async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize)
             probe_every: Duration::from_secs(if probing { args.probe_secs } else { 3_600 }),
             probe_batch: if probing { args.probe_batch } else { 0 },
             quiet_after: Duration::from_secs(args.quiet_secs.max(1)),
-            recycle_every: (args.recycle_mins > 0).then(|| Duration::from_secs(args.recycle_mins * 60)),
+            recycle_every: (args.recycle_mins > 0)
+                .then(|| Duration::from_secs(args.recycle_mins * 60)),
         },
     };
     tracing::info!(venue = venue.name(), env = ?args.env, out = %args.out, redundancy = args.redundancy,
         markets_per_socket, urls = ?venue.ws_urls(), "starting");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut collector = tokio::spawn(collector::run(venue, config, writer.tx.clone(), stats.clone(), shutdown_rx));
+    let mut collector = tokio::spawn(collector::run(
+        venue,
+        config,
+        writer.tx.clone(),
+        stats.clone(),
+        shutdown_rx,
+    ));
     // Registered once, so a signal arriving between loop iterations isn't lost.
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -196,7 +217,11 @@ async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize)
     }
 
     let _ = shutdown_tx.send(true);
-    if !collector.is_finished() && tokio::time::timeout(Duration::from_secs(10), &mut collector).await.is_err() {
+    if !collector.is_finished()
+        && tokio::time::timeout(Duration::from_secs(10), &mut collector)
+            .await
+            .is_err()
+    {
         tracing::warn!("sockets did not close within 10 s; finishing the file anyway");
     }
     let written = writer.finish()?;

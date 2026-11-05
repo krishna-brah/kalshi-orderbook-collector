@@ -16,13 +16,21 @@ pub enum LevelChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookError {
     /// A delta took a level below zero: this copy of the book has missed data.
-    NegativeQuantity { side: Side, price: i64, quantity: i64 },
+    NegativeQuantity {
+        side: Side,
+        price: i64,
+        quantity: i64,
+    },
 }
 
 impl std::fmt::Display for BookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NegativeQuantity { side, price, quantity } => {
+            Self::NegativeQuantity {
+                side,
+                price,
+                quantity,
+            } => {
                 write!(f, "{side} level {price} would go to {quantity}")
             }
         }
@@ -74,7 +82,11 @@ impl Book {
             LevelChange::Absolute(quantity) => quantity,
         };
         if next < 0 {
-            return Err(BookError::NegativeQuantity { side, price, quantity: next });
+            return Err(BookError::NegativeQuantity {
+                side,
+                price,
+                quantity: next,
+            });
         }
         if next == 0 {
             levels.remove(&price);
@@ -130,11 +142,23 @@ mod tests {
     #[test]
     fn deltas_accumulate_and_zero_removes_the_level() {
         let mut book = Book::default();
-        assert_eq!(book.apply(Side::Buy, 400_000, LevelChange::Delta(5_000_000)), Ok(5_000_000));
-        assert_eq!(book.apply(Side::Buy, 400_000, LevelChange::Delta(-2_000_000)), Ok(3_000_000));
+        assert_eq!(
+            book.apply(Side::Buy, 400_000, LevelChange::Delta(5_000_000)),
+            Ok(5_000_000)
+        );
+        assert_eq!(
+            book.apply(Side::Buy, 400_000, LevelChange::Delta(-2_000_000)),
+            Ok(3_000_000)
+        );
         assert_eq!(book.quantity(Side::Buy, 400_000), 3_000_000);
-        assert_eq!(book.apply(Side::Buy, 400_000, LevelChange::Delta(-3_000_000)), Ok(0));
-        assert!(book.is_empty(), "a level at zero must be deleted, not kept at 0");
+        assert_eq!(
+            book.apply(Side::Buy, 400_000, LevelChange::Delta(-3_000_000)),
+            Ok(0)
+        );
+        assert!(
+            book.is_empty(),
+            "a level at zero must be deleted, not kept at 0"
+        );
     }
 
     #[test]
@@ -143,7 +167,11 @@ mod tests {
         let before = book.clone();
         assert_eq!(
             book.apply(Side::Buy, 400_000, LevelChange::Delta(-2_000_000)),
-            Err(BookError::NegativeQuantity { side: Side::Buy, price: 400_000, quantity: -1_000_000 })
+            Err(BookError::NegativeQuantity {
+                side: Side::Buy,
+                price: 400_000,
+                quantity: -1_000_000
+            })
         );
         assert_eq!(book, before);
     }
@@ -151,8 +179,14 @@ mod tests {
     #[test]
     fn absolute_changes_replace_the_level() {
         let mut book = Book::from_levels([], [(600_000, 7_000_000)]);
-        assert_eq!(book.apply(Side::Sell, 600_000, LevelChange::Absolute(2_000_000)), Ok(2_000_000));
-        assert_eq!(book.apply(Side::Sell, 600_000, LevelChange::Absolute(0)), Ok(0));
+        assert_eq!(
+            book.apply(Side::Sell, 600_000, LevelChange::Absolute(2_000_000)),
+            Ok(2_000_000)
+        );
+        assert_eq!(
+            book.apply(Side::Sell, 600_000, LevelChange::Absolute(0)),
+            Ok(0)
+        );
         assert!(book.is_empty());
     }
 
@@ -162,8 +196,14 @@ mod tests {
             [(300_000, 1), (450_000, 2), (100_000, 3)],
             [(900_000, 4), (550_000, 5), (700_000, 6)],
         );
-        assert_eq!(book.bids().collect::<Vec<_>>(), [(450_000, 2), (300_000, 1), (100_000, 3)]);
-        assert_eq!(book.asks().collect::<Vec<_>>(), [(550_000, 5), (700_000, 6), (900_000, 4)]);
+        assert_eq!(
+            book.bids().collect::<Vec<_>>(),
+            [(450_000, 2), (300_000, 1), (100_000, 3)]
+        );
+        assert_eq!(
+            book.asks().collect::<Vec<_>>(),
+            [(550_000, 5), (700_000, 6), (900_000, 4)]
+        );
         assert!(!book.is_crossed());
         assert!(Book::from_levels([(600_000, 1)], [(550_000, 1)]).is_crossed());
     }

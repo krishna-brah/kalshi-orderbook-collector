@@ -51,7 +51,9 @@ impl Writer {
         let Self { tx, stop, thread } = self;
         drop(tx);
         let _ = stop.send(());
-        thread.join().map_err(|_| anyhow::anyhow!("writer thread panicked"))?
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer thread panicked"))?
     }
 }
 

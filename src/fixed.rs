@@ -38,7 +38,11 @@ pub fn parse(s: &str) -> Result<i64, ParseFixedError> {
     if int_part.is_empty() && frac_part.is_empty() {
         return Err(err());
     }
-    if !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit()) {
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
         return Err(err());
     }
     let (frac_kept, frac_rest) = frac_part.split_at(frac_part.len().min(DECIMALS));
@@ -86,7 +90,17 @@ mod tests {
 
     #[test]
     fn rejects_values_it_cannot_hold_exactly() {
-        for bad in ["", "-", ".", "abc", "1.2.3", "0.1234567", "1e3", " 1", "9223372036854.775808"] {
+        for bad in [
+            "",
+            "-",
+            ".",
+            "abc",
+            "1.2.3",
+            "0.1234567",
+            "1e3",
+            " 1",
+            "9223372036854.775808",
+        ] {
             assert!(parse(bad).is_err(), "{bad:?} should be rejected");
         }
     }

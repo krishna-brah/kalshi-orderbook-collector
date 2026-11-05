@@ -255,7 +255,13 @@ impl ShardCore {
         if down {
             self.up[slot] = false;
         }
-        let Self { markets, lagging, out, stats, .. } = self;
+        let Self {
+            markets,
+            lagging,
+            out,
+            stats,
+            ..
+        } = self;
         for (symbol, market) in markets.iter_mut() {
             let view = &mut market.views[slot];
             view.valid = false;
@@ -272,8 +278,22 @@ impl ShardCore {
 
     /// Book data from the socket in `slot`: `received` is when the frame came
     /// off the socket, `sent` when the venue says it sent it.
-    pub fn on_book(&mut self, slot: usize, received: Micros, sent: Option<Micros>, now: Instant, msg: BookMsg) {
-        let Self { markets, lagging, out, cmds, stats, .. } = self;
+    pub fn on_book(
+        &mut self,
+        slot: usize,
+        received: Micros,
+        sent: Option<Micros>,
+        now: Instant,
+        msg: BookMsg,
+    ) {
+        let Self {
+            markets,
+            lagging,
+            out,
+            cmds,
+            stats,
+            ..
+        } = self;
         let Some((_, symbol, market)) = markets.get_full_mut(&msg.market) else {
             return; // removed while frames were in flight
         };
@@ -304,18 +324,38 @@ impl ShardCore {
                     Some(source) if source == slot => {
                         if changed {
                             let view = &market.views[slot];
-                            emit_snapshot(out, stats, symbol, view, &mut market.last_out, received, SnapshotReason::Exchange);
+                            emit_snapshot(
+                                out,
+                                stats,
+                                symbol,
+                                view,
+                                &mut market.last_out,
+                                received,
+                                SnapshotReason::Exchange,
+                            );
                         }
                     }
                     Some(source) if market.views[source].valid => {}
                     _ => {
                         market.source = Some(slot);
                         let view = &market.views[slot];
-                        emit_snapshot(out, stats, symbol, view, &mut market.last_out, received, SnapshotReason::Exchange);
+                        emit_snapshot(
+                            out,
+                            stats,
+                            symbol,
+                            view,
+                            &mut market.last_out,
+                            received,
+                            SnapshotReason::Exchange,
+                        );
                     }
                 }
             }
-            BookBody::Level { side, price, change } => {
+            BookBody::Level {
+                side,
+                price,
+                change,
+            } => {
                 stats.deltas_in.inc();
                 let view = &mut market.views[slot];
                 if !view.valid {
@@ -358,7 +398,9 @@ impl ShardCore {
                     let at = stamp(&mut market.last_out, first_seen, stats);
                     out.push(OutMsg::Update(PriceLevelUpdateDomain {
                         backtest_timestamp: to_datetime(at),
-                        exchange_timestamp: to_datetime(market.views[slot].exchange_ts.unwrap_or(received)),
+                        exchange_timestamp: to_datetime(
+                            market.views[slot].exchange_ts.unwrap_or(received),
+                        ),
                         price_level: price,
                         quantity,
                         side,
@@ -373,7 +415,11 @@ impl ShardCore {
                 } else if let (Some(source), Some(clock)) = (market.source, msg.clock) {
                     let source_view = &market.views[source];
                     if market.lag.is_none() && source_view.valid && clock > source_view.clock {
-                        market.lag = Some(Lag { slot, clock, since: now });
+                        market.lag = Some(Lag {
+                            slot,
+                            clock,
+                            since: now,
+                        });
                         lagging.insert(symbol.clone());
                     }
                 }
@@ -399,25 +445,48 @@ impl ShardCore {
             }
             market.lag = None;
             self.lagging.remove(&symbol);
-            let behind = market.source.is_some_and(|s| market.views[s].clock < lag.clock);
+            let behind = market
+                .source
+                .is_some_and(|s| market.views[s].clock < lag.clock);
             if behind && market.views[lag.slot].valid {
                 tracing::info!(market = %symbol, from = ?market.source, to = lag.slot,
                     "source fell behind another copy; switching");
                 market.source = Some(lag.slot);
                 let view = &market.views[lag.slot];
-                emit_snapshot(&mut self.out, &self.stats, &symbol, view, &mut market.last_out, now_us, SnapshotReason::Lag);
+                emit_snapshot(
+                    &mut self.out,
+                    &self.stats,
+                    &symbol,
+                    view,
+                    &mut market.last_out,
+                    now_us,
+                    SnapshotReason::Lag,
+                );
             }
         }
     }
 
     /// The minute snapshot: every book with a usable source copy.
     pub fn snapshot_all(&mut self, now: Micros) {
-        let Self { markets, out, stats, .. } = self;
+        let Self {
+            markets,
+            out,
+            stats,
+            ..
+        } = self;
         for (symbol, market) in markets.iter_mut() {
             match market.source {
                 Some(source) if market.views[source].valid => {
                     let view = &market.views[source];
-                    emit_snapshot(out, stats, symbol, view, &mut market.last_out, now, SnapshotReason::Periodic);
+                    emit_snapshot(
+                        out,
+                        stats,
+                        symbol,
+                        view,
+                        &mut market.last_out,
+                        now,
+                        SnapshotReason::Periodic,
+                    );
                 }
                 _ => stats.uncovered.inc(),
             }
@@ -455,7 +524,18 @@ impl ShardCore {
     /// - An active market whose copies have all gone silent is probed; if it
     ///   is just quiet the probe matches and nothing changes.
     pub fn check_quiet(&mut self, now: Instant, now_us: Micros) {
-        let Self { markets, up, out, cmds, stats, quiet_after, lagging, redundancy, can_probe, .. } = self;
+        let Self {
+            markets,
+            up,
+            out,
+            cmds,
+            stats,
+            quiet_after,
+            lagging,
+            redundancy,
+            can_probe,
+            ..
+        } = self;
         let quiet_after = *quiet_after;
         let mut quiet: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
         let mut probes: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
@@ -463,16 +543,28 @@ impl ShardCore {
             let mut any_quiet = false;
             for slot in 0..market.views.len() {
                 let view = &market.views[slot];
-                if up[slot] && view.valid && view.behind_since.is_some_and(|t| now.duration_since(t) > quiet_after) {
+                if up[slot]
+                    && view.valid
+                    && view
+                        .behind_since
+                        .is_some_and(|t| now.duration_since(t) > quiet_after)
+                {
                     quiet[slot].push(symbol.clone());
                     any_quiet = true;
                 }
             }
-            let newest = market.views.iter().filter(|v| v.valid).filter_map(|v| v.last_delta).max();
+            let newest = market
+                .views
+                .iter()
+                .filter(|v| v.valid)
+                .filter_map(|v| v.last_delta)
+                .max();
             let Some(newest) = newest else { continue };
             let silent = now.duration_since(newest) > quiet_after;
             let was_active = market.updates_last_window >= ACTIVE_UPDATES;
-            let probed_recently = market.last_quiet_probe.is_some_and(|t| now.duration_since(t) < quiet_after);
+            let probed_recently = market
+                .last_quiet_probe
+                .is_some_and(|t| now.duration_since(t) < quiet_after);
             if *can_probe && !any_quiet && silent && was_active && !probed_recently {
                 market.last_quiet_probe = Some(now);
                 for slot in 0..market.views.len() {
@@ -494,7 +586,11 @@ impl ShardCore {
             }
             if symbols.len() > socket_limit {
                 stats.quiet_reconnects.inc();
-                tracing::warn!(slot, quiet = symbols.len(), "most of this socket's copies went quiet; reconnecting it");
+                tracing::warn!(
+                    slot,
+                    quiet = symbols.len(),
+                    "most of this socket's copies went quiet; reconnecting it"
+                );
                 cmds.push((slot, ConnCmd::Reconnect));
                 continue;
             }
@@ -502,7 +598,9 @@ impl ShardCore {
             tracing::warn!(slot, count = symbols.len(), first = %symbols[0],
                 "copies trailed the other copy's clock for too long; resubscribing them");
             for symbol in &symbols {
-                let Some(market) = markets.get_mut(symbol) else { continue };
+                let Some(market) = markets.get_mut(symbol) else {
+                    continue;
+                };
                 market.views[slot].valid = false;
                 if market.lag.is_some_and(|lag| lag.slot == slot) {
                     market.lag = None;
@@ -533,14 +631,23 @@ impl ShardCore {
         if self.markets.is_empty() {
             return 1.0;
         }
-        let valid = self.markets.values().filter(|m| m.views[slot].valid).count();
+        let valid = self
+            .markets
+            .values()
+            .filter(|m| m.views[slot].valid)
+            .count();
         valid as f64 / self.markets.len() as f64
     }
 
     /// The venue refused these markets on `slot`. That copy is unusable until
     /// the socket reconnects (which retries them); the repair sweep leaves it.
     pub fn refused(&mut self, slot: usize, markets: &[String], now: Micros) {
-        let Self { markets: tracked, out, stats, .. } = self;
+        let Self {
+            markets: tracked,
+            out,
+            stats,
+            ..
+        } = self;
         for symbol in markets {
             if let Some(market) = tracked.get_mut(symbol) {
                 market.views[slot].valid = false;
@@ -558,7 +665,15 @@ impl ShardCore {
     /// one), then a resubscribe, repeated every [`REPAIR_RETRY`]. If most of
     /// a socket needs repair, the socket is reconnected instead.
     pub fn check_repairs(&mut self, now: Instant) {
-        let Self { markets, up, cmds, stats, redundancy, can_probe, .. } = self;
+        let Self {
+            markets,
+            up,
+            cmds,
+            stats,
+            redundancy,
+            can_probe,
+            ..
+        } = self;
         let mut snapshots: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
         let mut resubscribe: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
         for (symbol, market) in markets.iter_mut() {
@@ -569,7 +684,11 @@ impl ShardCore {
                 }
                 let since = *view.invalid_since.get_or_insert(now);
                 let last = view.repair_at.unwrap_or(since);
-                let wait = if view.repair_stage == 0 { REPAIR_AFTER } else { REPAIR_RETRY };
+                let wait = if view.repair_stage == 0 {
+                    REPAIR_AFTER
+                } else {
+                    REPAIR_RETRY
+                };
                 if now.duration_since(last) < wait {
                     continue;
                 }
@@ -591,17 +710,27 @@ impl ShardCore {
             }
             if count > socket_limit {
                 stats.repair_reconnects.inc();
-                tracing::warn!(slot, count, "most of this socket's copies stayed unusable; reconnecting it");
+                tracing::warn!(
+                    slot,
+                    count,
+                    "most of this socket's copies stayed unusable; reconnecting it"
+                );
                 cmds.push((slot, ConnCmd::Reconnect));
                 continue;
             }
             stats.repairs.add(count as u64);
             tracing::info!(slot, count, "re-requesting copies that stayed unusable");
             if !snapshots[slot].is_empty() {
-                cmds.push((slot, ConnCmd::Snapshots(std::mem::take(&mut snapshots[slot]))));
+                cmds.push((
+                    slot,
+                    ConnCmd::Snapshots(std::mem::take(&mut snapshots[slot])),
+                ));
             }
             if !resubscribe[slot].is_empty() {
-                cmds.push((slot, ConnCmd::Resubscribe(std::mem::take(&mut resubscribe[slot]))));
+                cmds.push((
+                    slot,
+                    ConnCmd::Resubscribe(std::mem::take(&mut resubscribe[slot])),
+                ));
             }
         }
     }
@@ -618,7 +747,15 @@ fn reselect(symbol: &str, market: &mut Market, now: Micros, out: &mut Vec<OutMsg
     match best {
         Some(slot) => {
             let view = &market.views[slot];
-            emit_snapshot(out, stats, symbol, view, &mut market.last_out, now, SnapshotReason::Failover);
+            emit_snapshot(
+                out,
+                stats,
+                symbol,
+                view,
+                &mut market.last_out,
+                now,
+                SnapshotReason::Failover,
+            );
         }
         None => stats.uncovered.inc(),
     }
@@ -639,7 +776,13 @@ fn stamp(last_out: &mut Micros, at: Micros, stats: &Stats) -> Micros {
 
 /// Marks which usable copies trail the newest clock any copy has seen.
 fn refresh_behind(market: &mut Market, now: Instant) {
-    let newest = market.views.iter().filter(|v| v.valid).map(|v| v.clock).max().unwrap_or(0);
+    let newest = market
+        .views
+        .iter()
+        .filter(|v| v.valid)
+        .map(|v| v.clock)
+        .max()
+        .unwrap_or(0);
     for view in &mut market.views {
         if !view.valid || view.clock >= newest {
             view.behind_since = None;
@@ -656,7 +799,11 @@ fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats)
     let all = (1u64 << market.views.len().min(63)) - 1;
     // Several deltas can share a clock; each copy delivers them in the same
     // order, so match against the oldest arrival this route hasn't joined.
-    if let Some(i) = market.arrivals.iter().position(|a| a.clock == clock && a.seen & bit == 0) {
+    if let Some(i) = market
+        .arrivals
+        .iter()
+        .position(|a| a.clock == clock && a.seen & bit == 0)
+    {
         let arrival = &mut market.arrivals[i];
         let first = arrival.at;
         arrival.seen |= bit;
@@ -667,7 +814,11 @@ fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats)
         first.min(at)
     } else {
         stats.route(slot).first_arrivals.inc();
-        market.arrivals.push_back(Arrival { clock, at, seen: bit });
+        market.arrivals.push_back(Arrival {
+            clock,
+            at,
+            seen: bit,
+        });
         if market.arrivals.len() > ARRIVALS_KEPT {
             market.arrivals.pop_front();
         }
@@ -694,8 +845,22 @@ fn emit_snapshot(
     out.push(OutMsg::Snapshot(SnapshotDomain {
         received_at: to_datetime(at),
         exchange_timestamp: to_datetime(view.exchange_ts.unwrap_or(at)),
-        bids: view.book.bids().map(|(price_level, quantity)| SnapshotBidsEntryDomain { price_level, quantity }).collect(),
-        asks: view.book.asks().map(|(price_level, quantity)| SnapshotAsksEntryDomain { price_level, quantity }).collect(),
+        bids: view
+            .book
+            .bids()
+            .map(|(price_level, quantity)| SnapshotBidsEntryDomain {
+                price_level,
+                quantity,
+            })
+            .collect(),
+        asks: view
+            .book
+            .asks()
+            .map(|(price_level, quantity)| SnapshotAsksEntryDomain {
+                price_level,
+                quantity,
+            })
+            .collect(),
         symbol: symbol.to_owned(),
     }));
 }
@@ -742,37 +907,58 @@ async fn run<V: Venue>(
                 url: urls[slot % urls.len()].clone(),
                 mode: Mode::Books,
             };
-            conn::spawn(venue.clone(), spec, Vec::new(), events_tx.clone(), stats.clone(), shutdown.clone())
+            conn::spawn(
+                venue.clone(),
+                spec,
+                Vec::new(),
+                events_tx.clone(),
+                stats.clone(),
+                shutdown.clone(),
+            )
         })
         .collect();
     drop(events_tx);
     stats.sockets.add(cfg.redundancy as i64);
 
-    let mut core =
-        ShardCore::new(cfg.redundancy, cfg.lag_threshold, cfg.quiet_after, venue.snapshots_in_place(), stats.clone());
+    let mut core = ShardCore::new(
+        cfg.redundancy,
+        cfg.lag_threshold,
+        cfg.quiet_after,
+        venue.snapshots_in_place(),
+        stats.clone(),
+    );
     let mut next_recycle: Vec<Option<Instant>> = vec![None; cfg.redundancy];
-    let handle = |core: &mut ShardCore, next_recycle: &mut Vec<Option<Instant>>, event: ConnEvent| match event.kind {
+    let handle = |core: &mut ShardCore,
+                  next_recycle: &mut Vec<Option<Instant>>,
+                  event: ConnEvent| match event.kind {
         ConnEventKind::Up => {
             core.conn_up(event.slot);
             next_recycle[event.slot] = cfg.recycle_every.map(|p| Instant::now() + jittered(p));
         }
         ConnEventKind::Down { .. } => core.conn_lost(event.slot, true, now_micros()),
         ConnEventKind::Gap => core.conn_lost(event.slot, false, now_micros()),
-        ConnEventKind::Book { received, sent, msg } => core.on_book(event.slot, received, sent, Instant::now(), msg),
+        ConnEventKind::Book {
+            received,
+            sent,
+            msg,
+        } => core.on_book(event.slot, received, sent, Instant::now(), msg),
         ConnEventKind::Refused { markets, .. } => core.refused(event.slot, &markets, now_micros()),
         ConnEventKind::Lifecycle(_) => {}
     };
     // Frames already received are applied before anything time-driven
     // (minute snapshot, lag switch), so what that writes includes them.
-    let drain = |core: &mut ShardCore, next_recycle: &mut Vec<Option<Instant>>, events: &mut mpsc::UnboundedReceiver<ConnEvent>| {
+    let drain = |core: &mut ShardCore,
+                 next_recycle: &mut Vec<Option<Instant>>,
+                 events: &mut mpsc::UnboundedReceiver<ConnEvent>| {
         while let Ok(event) = events.try_recv() {
             handle(core, next_recycle, event);
         }
     };
     let mut lag_timer = tokio::time::interval(Duration::from_millis(100));
     let mut probe_timer = tokio::time::interval(cfg.probe_every);
-    let mut quiet_timer =
-        tokio::time::interval((cfg.quiet_after / 4).clamp(Duration::from_millis(100), Duration::from_secs(5)));
+    let mut quiet_timer = tokio::time::interval(
+        (cfg.quiet_after / 4).clamp(Duration::from_millis(100), Duration::from_secs(5)),
+    );
     let mut window_timer = tokio::time::interval(Duration::from_secs(300));
     let mut recycle_timer = tokio::time::interval(Duration::from_secs(10));
 

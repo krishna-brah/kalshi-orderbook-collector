@@ -65,12 +65,22 @@ impl<V: Venue> Manager<V> {
             if self.assigned.contains_key(&market) {
                 continue;
             }
-            if self.cfg.max_markets.is_some_and(|max| self.assigned.len() >= max) {
+            if self
+                .cfg
+                .max_markets
+                .is_some_and(|max| self.assigned.len() >= max)
+            {
                 break;
             }
             let shard = self.shard_with_room();
             self.shards[shard].size += 1;
-            self.assigned.insert(market.clone(), Assigned { shard, added: Instant::now() });
+            self.assigned.insert(
+                market.clone(),
+                Assigned {
+                    shard,
+                    added: Instant::now(),
+                },
+            );
             batches.entry(shard).or_default().push(market);
         }
         for (shard, batch) in batches {
@@ -97,7 +107,11 @@ impl<V: Venue> Manager<V> {
     }
 
     fn shard_with_room(&mut self) -> usize {
-        if let Some(index) = self.shards.iter().position(|s| s.size < self.cfg.markets_per_socket) {
+        if let Some(index) = self
+            .shards
+            .iter()
+            .position(|s| s.size < self.cfg.markets_per_socket)
+        {
             return index;
         }
         let id = self.shards.len();
@@ -117,7 +131,9 @@ impl<V: Venue> Manager<V> {
 /// Time until the next multiple of `period` since the epoch, so minute
 /// snapshots land on the wall-clock minute.
 fn until_aligned(period: Duration) -> Duration {
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let period_nanos = period.as_nanos().max(1);
     let into = since_epoch.as_nanos() % period_nanos;
     Duration::from_nanos((period_nanos - into) as u64)
@@ -154,7 +170,14 @@ pub async fn run<V: Venue>(
             mode: Mode::Lifecycle,
         };
         stats.sockets.add(1);
-        conn::spawn(venue.clone(), spec, Vec::new(), lifecycle_tx, stats.clone(), shutdown.clone())
+        conn::spawn(
+            venue.clone(),
+            spec,
+            Vec::new(),
+            lifecycle_tx,
+            stats.clone(),
+            shutdown.clone(),
+        )
     });
 
     let (listing_tx, mut listing_rx) = mpsc::unbounded_channel::<Listing>();

@@ -14,7 +14,9 @@ use anyhow::Context;
 use engineering_challenge::Side;
 use engineering_challenge::book::{Book, LevelChange};
 use engineering_challenge::fixed::SCALE;
-use engineering_challenge::util::dtos::challenge_orderbook::{AnyMessage, PriceLevelUpdateDomain, SnapshotDomain};
+use engineering_challenge::util::dtos::challenge_orderbook::{
+    AnyMessage, PriceLevelUpdateDomain, SnapshotDomain,
+};
 use engineering_challenge::util::{AlignedSbeReader, OrderbookSchema};
 use hdrhistogram::Histogram;
 use serde_json::json;
@@ -54,14 +56,18 @@ fn valid_price(price: i64) -> bool {
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().context("usage: check <file> [--json] [--top N]")?.clone();
+    let path = args
+        .first()
+        .context("usage: check <file> [--json] [--top N]")?
+        .clone();
     let json_out = args.iter().any(|a| a == "--json");
     let top: usize = match args.iter().position(|a| a == "--top") {
         Some(i) => args.get(i + 1).context("--top needs a number")?.parse()?,
         None => 0,
     };
 
-    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(&path).with_context(|| format!("opening {path}"))?;
+    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(&path)
+        .with_context(|| format!("opening {path}"))?;
     let mut markets: HashMap<String, Market> = HashMap::new();
     let mut report = Report::default();
     let mut delay = Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3)?;
@@ -74,10 +80,22 @@ fn main() -> anyhow::Result<()> {
                 report.snapshots += 1;
                 let ts = snapshot.received_at.timestamp_micros();
                 track_time(&mut report, ts);
-                let bids: Vec<(i64, i64)> = snapshot.bids.iter().map(|l| (l.price_level, l.quantity)).collect();
-                let asks: Vec<(i64, i64)> = snapshot.asks.iter().map(|l| (l.price_level, l.quantity)).collect();
-                let ordered = bids.windows(2).all(|w| w[0].0 > w[1].0) && asks.windows(2).all(|w| w[0].0 < w[1].0);
-                let sane = bids.iter().chain(&asks).all(|&(p, q)| valid_price(p) && q > 0);
+                let bids: Vec<(i64, i64)> = snapshot
+                    .bids
+                    .iter()
+                    .map(|l| (l.price_level, l.quantity))
+                    .collect();
+                let asks: Vec<(i64, i64)> = snapshot
+                    .asks
+                    .iter()
+                    .map(|l| (l.price_level, l.quantity))
+                    .collect();
+                let ordered = bids.windows(2).all(|w| w[0].0 > w[1].0)
+                    && asks.windows(2).all(|w| w[0].0 < w[1].0);
+                let sane = bids
+                    .iter()
+                    .chain(&asks)
+                    .all(|&(p, q)| valid_price(p) && q > 0);
                 if !ordered || !sane {
                     report.malformed_snapshots += 1;
                 }
@@ -123,7 +141,11 @@ fn main() -> anyhow::Result<()> {
                 market.last_ts = market.last_ts.max(ts);
                 market.updates += 1;
                 let side: Side = update.side;
-                let _ = market.book.apply(side, update.price_level, LevelChange::Absolute(update.quantity));
+                let _ = market.book.apply(
+                    side,
+                    update.price_level,
+                    LevelChange::Absolute(update.quantity),
+                );
                 if market.book.is_crossed() {
                     report.crossed_after_update += 1;
                 }
@@ -179,11 +201,19 @@ fn main() -> anyhow::Result<()> {
             "snapshots vs replayed book: {} matched, {} corrected it",
             report.snapshots_matching_replay, report.snapshots_correcting_replay
         );
-        println!("receive minus exchange stamp: p50 {:?} ms, p99 {:?} ms", ms(0.5), ms(0.99));
-        println!("hard failures: {hard_failures} {}", summary["hard_failures"]);
+        println!(
+            "receive minus exchange stamp: p50 {:?} ms, p99 {:?} ms",
+            ms(0.5),
+            ms(0.99)
+        );
+        println!(
+            "hard failures: {hard_failures} {}",
+            summary["hard_failures"]
+        );
     }
     if top > 0 {
-        let mut busiest: Vec<(&String, u64)> = markets.iter().map(|(s, m)| (s, m.updates)).collect();
+        let mut busiest: Vec<(&String, u64)> =
+            markets.iter().map(|(s, m)| (s, m.updates)).collect();
         busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         println!("most updated markets:");
         for (symbol, updates) in busiest.into_iter().take(top) {

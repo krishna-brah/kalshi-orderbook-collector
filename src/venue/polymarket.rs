@@ -38,7 +38,9 @@ impl Polymarket {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             ws_urls: vec![WS_URL.to_owned()],
-            http: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?,
         })
     }
 
@@ -74,8 +76,13 @@ fn millis(value: &Value) -> Option<i64> {
 }
 
 fn levels(value: &Value) -> anyhow::Result<Vec<(i64, i64)>> {
-    let Some(levels) = value.as_array() else { return Ok(Vec::new()) };
-    levels.iter().map(|l| Ok((price(&l["price"])?, decimal(&l["size"])?))).collect()
+    let Some(levels) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    levels
+        .iter()
+        .map(|l| Ok((price(&l["price"])?, decimal(&l["size"])?)))
+        .collect()
 }
 
 fn side(value: &Value) -> anyhow::Result<Side> {
@@ -102,7 +109,10 @@ fn decode_event(event: &Value, out: &mut Vec<Frame>) -> anyhow::Result<()> {
     };
     match event["event_type"].as_str() {
         Some("book") => {
-            let body = BookBody::Snapshot { bids: levels(&event["bids"])?, asks: levels(&event["asks"])? };
+            let body = BookBody::Snapshot {
+                bids: levels(&event["bids"])?,
+                asks: levels(&event["asks"])?,
+            };
             out.push(book(&event["asset_id"], body)?);
         }
         Some("price_change") => {
@@ -128,7 +138,11 @@ fn decode_event(event: &Value, out: &mut Vec<Frame>) -> anyhow::Result<()> {
                 }
             }
         }
-        _ => out.push(Frame { seq: None, sent_at: None, msg: Decoded::Ignored }),
+        _ => out.push(Frame {
+            seq: None,
+            sent_at: None,
+            msg: Decoded::Ignored,
+        }),
     }
     Ok(())
 }
@@ -176,7 +190,12 @@ impl Venue for Polymarket {
         json!({"assets_ids": markets, "operation": "unsubscribe"}).to_string()
     }
 
-    fn request_snapshots(&self, _req_id: u64, _sid: Option<u64>, _markets: &[String]) -> Option<String> {
+    fn request_snapshots(
+        &self,
+        _req_id: u64,
+        _sid: Option<u64>,
+        _markets: &[String],
+    ) -> Option<String> {
         None
     }
 
@@ -198,7 +217,11 @@ impl Venue for Polymarket {
 
     fn decode(&self, text: &str, out: &mut Vec<Frame>) -> anyhow::Result<()> {
         if text.eq_ignore_ascii_case("pong") {
-            out.push(Frame { seq: None, sent_at: None, msg: Decoded::Ignored });
+            out.push(Frame {
+                seq: None,
+                sent_at: None,
+                msg: Decoded::Ignored,
+            });
             return Ok(());
         }
         match serde_json::from_str::<Value>(text)? {
@@ -225,14 +248,24 @@ impl Venue for Polymarket {
                 if let Some(cursor) = &cursor {
                     query.push(("after_cursor", cursor.clone()));
                 }
-                let page: KeysetPage =
-                    http.get(MARKETS_URL).query(&query).send().await?.error_for_status()?.json().await?;
+                let page: KeysetPage = http
+                    .get(MARKETS_URL)
+                    .query(&query)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 let mut tokens = Vec::new();
                 for market in &page.markets {
-                    if market.enable_order_book != Some(true) || market.accepting_orders == Some(false) {
+                    if market.enable_order_book != Some(true)
+                        || market.accepting_orders == Some(false)
+                    {
                         continue;
                     }
-                    let Some(ids) = &market.clob_token_ids else { continue };
+                    let Some(ids) = &market.clob_token_ids else {
+                        continue;
+                    };
                     let ids: Vec<String> = serde_json::from_str(ids).unwrap_or_default();
                     tokens.extend(ids.into_iter().filter(|id| seen.insert(id.clone())));
                 }
@@ -275,12 +308,17 @@ mod tests {
                  "bids":[{"price":"0.48","size":"30"},{"price":"0.47","size":"12.5"}],
                  "asks":[{"price":"0.52","size":"25"}],"hash":"h"}]"#,
         );
-        let Decoded::Book(book) = &frames[0].msg else { panic!() };
+        let Decoded::Book(book) = &frames[0].msg else {
+            panic!()
+        };
         assert_eq!(book.market, "123");
         assert_eq!(book.clock, Some(1_757_908_892_351));
         assert_eq!(
             book.body,
-            BookBody::Snapshot { bids: vec![(480_000, 30_000_000), (470_000, 12_500_000)], asks: vec![(520_000, 25_000_000)] }
+            BookBody::Snapshot {
+                bids: vec![(480_000, 30_000_000), (470_000, 12_500_000)],
+                asks: vec![(520_000, 25_000_000)]
+            }
         );
     }
 
@@ -301,8 +339,22 @@ mod tests {
         assert_eq!(
             bodies,
             [
-                ("123".into(), BookBody::Level { side: Side::Buy, price: 500_000, change: LevelChange::Absolute(200_000_000) }),
-                ("456".into(), BookBody::Level { side: Side::Sell, price: 500_000, change: LevelChange::Absolute(0) }),
+                (
+                    "123".into(),
+                    BookBody::Level {
+                        side: Side::Buy,
+                        price: 500_000,
+                        change: LevelChange::Absolute(200_000_000)
+                    }
+                ),
+                (
+                    "456".into(),
+                    BookBody::Level {
+                        side: Side::Sell,
+                        price: 500_000,
+                        change: LevelChange::Absolute(0)
+                    }
+                ),
             ]
         );
     }
@@ -310,6 +362,9 @@ mod tests {
     #[test]
     fn pong_and_other_events_are_ignored() {
         assert_eq!(decode("PONG")[0].msg, Decoded::Ignored);
-        assert_eq!(decode(r#"{"event_type":"last_trade_price","asset_id":"1","price":"0.5"}"#)[0].msg, Decoded::Ignored);
+        assert_eq!(
+            decode(r#"{"event_type":"last_trade_price","asset_id":"1","price":"0.5"}"#)[0].msg,
+            Decoded::Ignored
+        );
     }
 }

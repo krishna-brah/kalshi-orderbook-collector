@@ -73,16 +73,26 @@ pub struct ConnEvent {
 #[derive(Debug)]
 pub enum ConnEventKind {
     Up,
-    Down { reason: String },
+    Down {
+        reason: String,
+    },
     /// Frames were lost; every book this socket carries is suspect until it
     /// is snapshotted again. Fresh snapshots have already been requested.
     Gap,
     /// Book data, with when it came off the socket and when the venue says
     /// it sent it.
-    Book { received: Micros, sent: Option<Micros>, msg: BookMsg },
+    Book {
+        received: Micros,
+        sent: Option<Micros>,
+        msg: BookMsg,
+    },
     Lifecycle(Lifecycle),
     /// The venue would not subscribe these markets.
-    Refused { markets: Vec<String>, code: i64, message: String },
+    Refused {
+        markets: Vec<String>,
+        code: i64,
+        message: String,
+    },
 }
 
 pub struct ConnHandle {
@@ -107,8 +117,19 @@ pub fn spawn<V: Venue>(
     shutdown: watch::Receiver<bool>,
 ) -> ConnHandle {
     let (cmds, cmds_rx) = mpsc::unbounded_channel();
-    let conn = Conn { venue, spec, desired: markets.into_iter().collect(), cmds: cmds_rx, events, stats, shutdown };
-    ConnHandle { cmds, task: tokio::spawn(conn.run()) }
+    let conn = Conn {
+        venue,
+        spec,
+        desired: markets.into_iter().collect(),
+        cmds: cmds_rx,
+        events,
+        stats,
+        shutdown,
+    };
+    ConnHandle {
+        cmds,
+        task: tokio::spawn(conn.run()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,11 +221,17 @@ impl<V: Venue> Conn<V> {
     }
 
     fn emit(&self, kind: ConnEventKind) {
-        let _ = self.events.send(ConnEvent { slot: self.spec.slot, kind });
+        let _ = self.events.send(ConnEvent {
+            slot: self.spec.slot,
+            kind,
+        });
     }
 
     fn batches(&self, markets: &[String]) -> Vec<Vec<String>> {
-        markets.chunks(self.venue.command_batch().max(1)).map(<[String]>::to_vec).collect()
+        markets
+            .chunks(self.venue.command_batch().max(1))
+            .map(<[String]>::to_vec)
+            .collect()
     }
 
     /// Applies a command to the desired market set and queues what to send.
@@ -212,19 +239,31 @@ impl<V: Venue> Conn<V> {
         let mut queue = VecDeque::new();
         match cmd {
             ConnCmd::Add(markets) => {
-                let new: Vec<String> = markets.into_iter().filter(|m| self.desired.insert(m.clone())).collect();
+                let new: Vec<String> = markets
+                    .into_iter()
+                    .filter(|m| self.desired.insert(m.clone()))
+                    .collect();
                 queue.extend(self.batches(&new).into_iter().map(Command::Add));
             }
             ConnCmd::Remove(markets) => {
-                let gone: Vec<String> = markets.into_iter().filter(|m| self.desired.remove(m)).collect();
+                let gone: Vec<String> = markets
+                    .into_iter()
+                    .filter(|m| self.desired.remove(m))
+                    .collect();
                 queue.extend(self.batches(&gone).into_iter().map(Command::Remove));
             }
             ConnCmd::Snapshots(markets) => {
-                let live: Vec<String> = markets.into_iter().filter(|m| self.desired.contains(m)).collect();
+                let live: Vec<String> = markets
+                    .into_iter()
+                    .filter(|m| self.desired.contains(m))
+                    .collect();
                 queue.extend(self.batches(&live).into_iter().map(Command::Snapshots));
             }
             ConnCmd::Resubscribe(markets) => {
-                let live: Vec<String> = markets.into_iter().filter(|m| self.desired.contains(m)).collect();
+                let live: Vec<String> = markets
+                    .into_iter()
+                    .filter(|m| self.desired.contains(m))
+                    .collect();
                 for batch in self.batches(&live) {
                     queue.push_back(Command::Remove(batch.clone()));
                     queue.push_back(Command::Add(batch));
@@ -244,7 +283,9 @@ impl<V: Venue> Conn<V> {
             self.accept(cmd, None);
         }
         let request = self.venue.connect_request(&self.spec.url)?;
-        let config = WebSocketConfig::default().max_message_size(Some(64 << 20)).max_frame_size(Some(16 << 20));
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(64 << 20))
+            .max_frame_size(Some(16 << 20));
         let (ws, _) = tokio::time::timeout(
             CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async_with_config(request, Some(config), true),
@@ -272,7 +313,9 @@ impl<V: Venue> Conn<V> {
         match self.spec.mode {
             Mode::Books => {
                 let all: Vec<String> = self.desired.iter().cloned().collect();
-                session.queue.extend(self.batches(&all).into_iter().map(Command::Add));
+                session
+                    .queue
+                    .extend(self.batches(&all).into_iter().map(Command::Add));
             }
             Mode::Lifecycle => session.queue.push_back(Command::Lifecycle),
         }
@@ -280,7 +323,8 @@ impl<V: Venue> Conn<V> {
         let mut last_frame = Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_millis(500));
         let keepalive = self.venue.keepalive();
-        let mut keepalive_timer = tokio::time::interval(keepalive.map_or(Duration::from_secs(3600), |k| k.0));
+        let mut keepalive_timer =
+            tokio::time::interval(keepalive.map_or(Duration::from_secs(3600), |k| k.0));
         let mut frames = Vec::new();
 
         loop {
@@ -355,7 +399,12 @@ impl<V: Venue> Conn<V> {
         }
     }
 
-    async fn send<S>(&mut self, sink: &mut S, session: &mut Session, command: Command) -> anyhow::Result<()>
+    async fn send<S>(
+        &mut self,
+        sink: &mut S,
+        session: &mut Session,
+        command: Command,
+    ) -> anyhow::Result<()>
     where
         S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
@@ -370,11 +419,15 @@ impl<V: Venue> Conn<V> {
                 Some(self.venue.subscribe_books(id, markets))
             }
             Command::Add(markets) => Some(self.venue.add_markets(id, session.sid, markets)),
-            Command::Remove(markets) if subscribed => Some(self.venue.remove_markets(id, session.sid, markets)),
-            Command::Snapshots(markets) if subscribed => match self.venue.request_snapshots(id, session.sid, markets) {
-                Some(text) => Some(text),
-                None => bail!("the venue can't re-snapshot in place; reconnecting"),
-            },
+            Command::Remove(markets) if subscribed => {
+                Some(self.venue.remove_markets(id, session.sid, markets))
+            }
+            Command::Snapshots(markets) if subscribed => {
+                match self.venue.request_snapshots(id, session.sid, markets) {
+                    Some(text) => Some(text),
+                    None => bail!("the venue can't re-snapshot in place; reconnecting"),
+                }
+            }
             Command::Remove(_) | Command::Snapshots(_) => None,
             Command::Lifecycle => self.venue.subscribe_lifecycle(id),
         };
@@ -385,7 +438,12 @@ impl<V: Venue> Conn<V> {
         // are paced instead.
         let replied = matches!(command, Command::Add(_) | Command::Lifecycle);
         if self.venue.acks_commands() && replied {
-            session.in_flight = Some(InFlight { id, command, subscribe, sent: Instant::now() });
+            session.in_flight = Some(InFlight {
+                id,
+                command,
+                subscribe,
+                sent: Instant::now(),
+            });
         } else {
             session.not_before = Instant::now() + UNACKED_COMMAND_GAP;
             session.unacked.push_back(id);
@@ -396,7 +454,12 @@ impl<V: Venue> Conn<V> {
         Ok(())
     }
 
-    fn handle(&mut self, frame: Frame, received: Micros, session: &mut Session) -> anyhow::Result<()> {
+    fn handle(
+        &mut self,
+        frame: Frame,
+        received: Micros,
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
         if let Some((sid, seq)) = frame.seq {
             if let Some(previous) = session.seqs.insert(sid, seq) {
                 if seq != previous + 1 {
@@ -408,9 +471,16 @@ impl<V: Venue> Conn<V> {
         match frame.msg {
             Decoded::Book(msg) => {
                 if let Some(sent) = frame.sent_at {
-                    self.stats.route(self.spec.slot).delay.record(received - sent);
+                    self.stats
+                        .route(self.spec.slot)
+                        .delay
+                        .record(received - sent);
                 }
-                self.emit(ConnEventKind::Book { received, sent: frame.sent_at, msg });
+                self.emit(ConnEventKind::Book {
+                    received,
+                    sent: frame.sent_at,
+                    msg,
+                });
             }
             Decoded::Subscribed { req_id, sid } => {
                 if session.in_flight.as_ref().is_some_and(|f| f.id == req_id) {
@@ -427,7 +497,11 @@ impl<V: Venue> Conn<V> {
                     session.retries = 0;
                 }
             }
-            Decoded::Error { req_id, code, message } => {
+            Decoded::Error {
+                req_id,
+                code,
+                message,
+            } => {
                 // The subscription itself is gone; only a new connection
                 // (which resubscribes everything) can fix that.
                 if matches!(code, ERROR_UNKNOWN_SID | ERROR_BUFFER_OVERFLOW) {
@@ -453,15 +527,27 @@ impl<V: Venue> Conn<V> {
         Ok(())
     }
 
-    fn command_failed(&mut self, failed: InFlight, code: i64, message: String, session: &mut Session) -> anyhow::Result<()> {
+    fn command_failed(
+        &mut self,
+        failed: InFlight,
+        code: i64,
+        message: String,
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
         if failed.subscribe {
             // Nothing is subscribed yet, so the retry must subscribe again.
             session.subscribe_sent = false;
         }
-        if matches!(code, ERROR_RATE_LIMITED | ERROR_COMMAND_TIMEOUT | ERROR_GENERAL) {
+        if matches!(
+            code,
+            ERROR_RATE_LIMITED | ERROR_COMMAND_TIMEOUT | ERROR_GENERAL
+        ) {
             session.retries += 1;
             if session.retries > MAX_RETRIES {
-                bail!("{} retryable errors in a row (last: code {code}: {message})", session.retries);
+                bail!(
+                    "{} retryable errors in a row (last: code {code}: {message})",
+                    session.retries
+                );
             }
             if code == ERROR_RATE_LIMITED {
                 self.stats.rate_limited.inc();
@@ -483,7 +569,11 @@ impl<V: Venue> Conn<V> {
                 // again. Forgetting them would drop them for good.
                 tracing::warn!(conn = %self.spec.label, code, %message, count = markets.len(), first = %markets[0], "markets refused");
                 self.stats.refused.add(markets.len() as u64);
-                self.emit(ConnEventKind::Refused { markets, code, message });
+                self.emit(ConnEventKind::Refused {
+                    markets,
+                    code,
+                    message,
+                });
             }
             Command::Lifecycle => bail!("lifecycle subscription refused (code {code}: {message})"),
             Command::Remove(_) | Command::Snapshots(_) => {
@@ -508,8 +598,12 @@ impl<V: Venue> Conn<V> {
             bail!("data lost and the venue can't re-snapshot in place; reconnecting");
         }
         let all: Vec<String> = self.desired.iter().cloned().collect();
-        session.queue.retain(|c| !matches!(c, Command::Snapshots(_)));
-        session.queue.extend(self.batches(&all).into_iter().map(Command::Snapshots));
+        session
+            .queue
+            .retain(|c| !matches!(c, Command::Snapshots(_)));
+        session
+            .queue
+            .extend(self.batches(&all).into_iter().map(Command::Snapshots));
         Ok(())
     }
 }

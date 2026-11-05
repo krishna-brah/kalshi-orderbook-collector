@@ -57,7 +57,11 @@ pub struct Latency {
 
 impl Default for Latency {
     fn default() -> Self {
-        Self { hist: Mutex::new(histogram()), window: Mutex::new(histogram()), negative: Counter::default() }
+        Self {
+            hist: Mutex::new(histogram()),
+            window: Mutex::new(histogram()),
+            negative: Counter::default(),
+        }
     }
 }
 
@@ -67,8 +71,14 @@ impl Latency {
             self.negative.inc();
         }
         let value = micros.max(1) as u64;
-        self.hist.lock().unwrap_or_else(|e| e.into_inner()).saturating_record(value);
-        self.window.lock().unwrap_or_else(|e| e.into_inner()).saturating_record(value);
+        self.hist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .saturating_record(value);
+        self.window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .saturating_record(value);
     }
 
     /// p50 and p99 (ms) since the last call, then starts a new window.
@@ -179,7 +189,13 @@ impl Stats {
     pub fn new(urls: &[String]) -> Self {
         Self {
             started: Instant::now(),
-            routes: urls.iter().map(|url| RouteStats { url: url.clone(), ..Default::default() }).collect(),
+            routes: urls
+                .iter()
+                .map(|url| RouteStats {
+                    url: url.clone(),
+                    ..Default::default()
+                })
+                .collect(),
             markets: Gauge::default(),
             sockets_up: Gauge::default(),
             sockets: Gauge::default(),
@@ -266,7 +282,11 @@ impl Stats {
             self.writer_queue.get(),
             delays.join(" "),
         );
-        *prev = Rates { at: now, frames, updates: self.updates_out.get() };
+        *prev = Rates {
+            at: now,
+            frames,
+            updates: self.updates_out.get(),
+        };
         line
     }
 
@@ -329,6 +349,10 @@ pub struct Rates {
 
 impl Default for Rates {
     fn default() -> Self {
-        Self { at: Instant::now(), frames: 0, updates: 0 }
+        Self {
+            at: Instant::now(),
+            frames: 0,
+            updates: 0,
+        }
     }
 }

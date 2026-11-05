@@ -18,7 +18,10 @@ const REST: &str = "https://external-api.demo.kalshi.co/trade-api/v2";
 const WS_PATH: &str = "/trade-api/ws/v2";
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 async fn open_tickers(max: usize) -> Result<Vec<String>> {
@@ -30,9 +33,19 @@ async fn open_tickers(max: usize) -> Result<Vec<String>> {
         if !cursor.is_empty() {
             url.push_str(&format!("&cursor={cursor}"));
         }
-        let body: Value = client.get(&url).send().await?.error_for_status()?.json().await?;
+        let body: Value = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         let markets = body["markets"].as_array().context("markets")?;
-        out.extend(markets.iter().filter_map(|m| m["ticker"].as_str().map(str::to_owned)));
+        out.extend(
+            markets
+                .iter()
+                .filter_map(|m| m["ticker"].as_str().map(str::to_owned)),
+        );
         cursor = body["cursor"].as_str().unwrap_or_default().to_owned();
         if cursor.is_empty() || markets.is_empty() {
             break;
@@ -45,8 +58,15 @@ async fn open_tickers(max: usize) -> Result<Vec<String>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let host = args.get(1).cloned().unwrap_or("external-api-ws.demo.kalshi.co".into());
-    let max: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(20_000);
+    let host = args
+        .get(1)
+        .cloned()
+        .unwrap_or("external-api-ws.demo.kalshi.co".into());
+    let max: usize = args
+        .get(2)
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(20_000);
     let batch: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(1_000);
     let fixture = args.get(4).cloned();
 
@@ -66,11 +86,19 @@ async fn main() -> Result<()> {
     h.insert("KALSHI-ACCESS-TIMESTAMP", ts.parse()?);
     h.insert(
         "KALSHI-ACCESS-SIGNATURE",
-        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()).parse()?,
+        base64::engine::general_purpose::STANDARD
+            .encode(sig.to_bytes())
+            .parse()?,
     );
     let t1 = Instant::now();
-    let (ws, resp) = tokio_tungstenite::connect_async(req).await.context("connect")?;
-    eprintln!("connected to {host} in {:?} (HTTP {})", t1.elapsed(), resp.status());
+    let (ws, resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .context("connect")?;
+    eprintln!(
+        "connected to {host} in {:?} (HTTP {})",
+        t1.elapsed(),
+        resp.status()
+    );
     let (mut tx, mut rx) = ws.split();
 
     let mut fixture = fixture.map(std::fs::File::create).transpose()?;
@@ -145,7 +173,10 @@ async fn main() -> Result<()> {
             }
             "ok" => eprintln!("ok id={} after {:?}", v["id"], sent_at.elapsed()),
             "error" => {
-                eprintln!("ERROR {} at {} markets requested: {text}", v["msg"]["code"], next);
+                eprintln!(
+                    "ERROR {} at {} markets requested: {text}",
+                    v["msg"]["code"], next
+                );
                 break;
             }
             "orderbook_snapshot" => {
@@ -183,7 +214,12 @@ async fn main() -> Result<()> {
         }
     }
     delays.sort_unstable();
-    let pct = |p: f64| delays.get(((delays.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(-1);
+    let pct = |p: f64| {
+        delays
+            .get(((delays.len() as f64 - 1.0) * p) as usize)
+            .copied()
+            .unwrap_or(-1)
+    };
     eprintln!(
         "done: requested {next}, snapshots {snapshots}, deltas {deltas}, seq gaps {gaps}, delay ms p50 {} p99 {} max {}",
         pct(0.5),

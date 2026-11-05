@@ -37,11 +37,20 @@ pub struct Frame {
 pub enum Decoded {
     Book(BookMsg),
     /// A `subscribe` command succeeded; `sid` names the new subscription.
-    Subscribed { req_id: u64, sid: u64 },
+    Subscribed {
+        req_id: u64,
+        sid: u64,
+    },
     /// Any other command succeeded.
-    Ack { req_id: u64 },
+    Ack {
+        req_id: u64,
+    },
     /// A command failed.
-    Error { req_id: Option<u64>, code: i64, message: String },
+    Error {
+        req_id: Option<u64>,
+        code: i64,
+        message: String,
+    },
     Lifecycle(Lifecycle),
     /// Heartbeats and frame types the collector does not use.
     Ignored,
@@ -62,8 +71,15 @@ pub struct BookMsg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BookBody {
-    Snapshot { bids: Vec<(i64, i64)>, asks: Vec<(i64, i64)> },
-    Level { side: Side, price: i64, change: LevelChange },
+    Snapshot {
+        bids: Vec<(i64, i64)>,
+        asks: Vec<(i64, i64)>,
+    },
+    Level {
+        side: Side,
+        price: i64,
+        change: LevelChange,
+    },
 }
 
 /// Market listing changes pushed by the venue.
@@ -71,8 +87,13 @@ pub enum BookBody {
 pub enum Lifecycle {
     /// The market is (or will be at `open_at`, seconds since the epoch) open
     /// for trading.
-    Opened { market: String, open_at: Option<i64> },
+    Opened {
+        market: String,
+        open_at: Option<i64>,
+    },
     /// The market has finished trading.
-    Closed { market: String },
+    Closed {
+        market: String,
+    },
     Other,
 }

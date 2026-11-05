@@ -74,7 +74,8 @@ impl Signer {
         let rsa_key = {
             use rsa::pkcs1::DecodeRsaPrivateKey as _;
             use rsa::pkcs8::DecodePrivateKey as _;
-            rsa::RsaPrivateKey::from_pkcs1_pem(pem).or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
+            rsa::RsaPrivateKey::from_pkcs1_pem(pem)
+                .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
         }
         .context("key file is neither an Ed25519 nor an RSA private key")?;
         Ok(Self::Rsa(rsa::pss::BlindedSigningKey::new(rsa_key)))
@@ -89,7 +90,8 @@ impl Signer {
             }
             Self::Rsa(key) => {
                 use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _};
-                key.sign_with_rng(&mut rand_core::OsRng, text.as_bytes()).to_vec()
+                key.sign_with_rng(&mut rand_core::OsRng, text.as_bytes())
+                    .to_vec()
             }
         };
         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -111,7 +113,9 @@ impl Kalshi {
             signer,
             ws_urls: env.ws_urls().iter().map(|u| (*u).to_owned()).collect(),
             rest_base: env.rest_base().to_owned(),
-            http: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?,
         })
     }
 
@@ -204,7 +208,10 @@ fn yes_level(side: &str, price: &str) -> anyhow::Result<(Side, i64)> {
     }
 }
 
-fn snapshot_levels(levels: Option<Vec<(Cow<'_, str>, Cow<'_, str>)>>, side: &str) -> anyhow::Result<Vec<(i64, i64)>> {
+fn snapshot_levels(
+    levels: Option<Vec<(Cow<'_, str>, Cow<'_, str>)>>,
+    side: &str,
+) -> anyhow::Result<Vec<(i64, i64)>> {
     levels
         .unwrap_or_default()
         .iter()
@@ -213,7 +220,9 @@ fn snapshot_levels(levels: Option<Vec<(Cow<'_, str>, Cow<'_, str>)>>, side: &str
 }
 
 fn msg<'a, T: Deserialize<'a>>(env: &Envelope<'a>) -> anyhow::Result<T> {
-    let raw = env.msg.with_context(|| format!("{} frame without msg", env.kind))?;
+    let raw = env
+        .msg
+        .with_context(|| format!("{} frame without msg", env.kind))?;
     Ok(serde_json::from_str(raw.get())?)
 }
 
@@ -249,7 +258,12 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
     loop {
         attempt += 1;
         let result = async {
-            let reply = http.get(url).query(query).send().await?.error_for_status()?;
+            let reply = http
+                .get(url)
+                .query(query)
+                .send()
+                .await?
+                .error_for_status()?;
             anyhow::Ok(reply.json::<T>().await?)
         }
         .await;
@@ -276,8 +290,13 @@ impl Venue for Kalshi {
 
     fn connect_request(&self, url: &str) -> anyhow::Result<Request> {
         let mut request = url.into_client_request()?;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis().to_string();
-        let signature = self.signer.sign(&format!("{timestamp}GET{}", request.uri().path()));
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis()
+            .to_string();
+        let signature = self
+            .signer
+            .sign(&format!("{timestamp}GET{}", request.uri().path()));
         let headers = request.headers_mut();
         headers.insert("KALSHI-ACCESS-KEY", self.key_id.parse()?);
         headers.insert("KALSHI-ACCESS-TIMESTAMP", timestamp.parse()?);
@@ -306,7 +325,12 @@ impl Venue for Kalshi {
         Self::update(req_id, sid, markets, "delete_markets")
     }
 
-    fn request_snapshots(&self, req_id: u64, sid: Option<u64>, markets: &[String]) -> Option<String> {
+    fn request_snapshots(
+        &self,
+        req_id: u64,
+        sid: Option<u64>,
+        markets: &[String],
+    ) -> Option<String> {
         Some(Self::update(req_id, sid, markets, "get_snapshot"))
     }
 
@@ -345,23 +369,39 @@ impl Venue for Kalshi {
                     market: m.market_ticker.into_owned(),
                     clock: m.clock,
                     exchange_ts: m.ts_ms.map(|ms| ms * 1_000),
-                    body: BookBody::Level { side, price, change: LevelChange::Delta(fixed::parse(&m.delta_fp)?) },
+                    body: BookBody::Level {
+                        side,
+                        price,
+                        change: LevelChange::Delta(fixed::parse(&m.delta_fp)?),
+                    },
                 })
             }
             "subscribed" => {
                 let m: SubscribedMsg = msg(&env)?;
-                Decoded::Subscribed { req_id: env.id.unwrap_or(0), sid: m.sid }
+                Decoded::Subscribed {
+                    req_id: env.id.unwrap_or(0),
+                    sid: m.sid,
+                }
             }
-            "ok" | "unsubscribed" => Decoded::Ack { req_id: env.id.unwrap_or(0) },
+            "ok" | "unsubscribed" => Decoded::Ack {
+                req_id: env.id.unwrap_or(0),
+            },
             "error" => {
                 let m: ErrorMsg = msg(&env)?;
-                Decoded::Error { req_id: env.id, code: m.code, message: m.msg }
+                Decoded::Error {
+                    req_id: env.id,
+                    code: m.code,
+                    message: m.msg,
+                }
             }
             "market_lifecycle_v2" => {
                 let m: LifecycleMsg = msg(&env)?;
                 let market = m.market_ticker.into_owned();
                 Decoded::Lifecycle(match &*m.event_type {
-                    "created" | "activated" => Lifecycle::Opened { market, open_at: m.open_ts },
+                    "created" | "activated" => Lifecycle::Opened {
+                        market,
+                        open_at: m.open_ts,
+                    },
                     "determined" | "settled" => Lifecycle::Closed { market },
                     _ => Lifecycle::Other,
                 })
@@ -387,7 +427,11 @@ impl Venue for Kalshi {
             let mut cursors_seen = HashSet::new();
             let mut total = 0;
             loop {
-                let mut query = vec![("status", "open"), ("mve_filter", "exclude"), ("limit", "1000")];
+                let mut query = vec![
+                    ("status", "open"),
+                    ("mve_filter", "exclude"),
+                    ("limit", "1000"),
+                ];
                 if !cursor.is_empty() {
                     query.push(("cursor", cursor.as_str()));
                 }
@@ -415,7 +459,8 @@ impl Venue for Kalshi {
         let url = format!("{}/markets/{market}", self.rest_base);
         async move {
             let reply: MarketReply = get_json(&http, &url, &[]).await?;
-            Ok(matches!(reply.market.status.as_str(), "active" | "open") && reply.market.mve_collection_ticker.is_none())
+            Ok(matches!(reply.market.status.as_str(), "active" | "open")
+                && reply.market.mve_collection_ticker.is_none())
         }
     }
 }
@@ -455,7 +500,9 @@ mod tests {
         );
         assert_eq!(frame.seq, Some((1, 1)));
         assert_eq!(frame.sent_at, Some(1_793_899_605_589_000));
-        let Decoded::Book(book) = frame.msg else { panic!("{frame:?}") };
+        let Decoded::Book(book) = frame.msg else {
+            panic!("{frame:?}")
+        };
         assert_eq!(book.market, "KXTEST-1");
         assert_eq!(book.clock, Some(2_604_399_952));
         assert_eq!(
@@ -472,8 +519,16 @@ mod tests {
         let frame = decode_one(
             r#"{"type":"orderbook_snapshot","sid":3,"seq":9,"msg":{"market_ticker":"KXTEST-2","clock":0}}"#,
         );
-        let Decoded::Book(book) = frame.msg else { panic!() };
-        assert_eq!(book.body, BookBody::Snapshot { bids: vec![], asks: vec![] });
+        let Decoded::Book(book) = frame.msg else {
+            panic!()
+        };
+        assert_eq!(
+            book.body,
+            BookBody::Snapshot {
+                bids: vec![],
+                asks: vec![]
+            }
+        );
     }
 
     #[test]
@@ -483,11 +538,17 @@ mod tests {
                 "msg":{"market_ticker":"KXPLAT","market_id":"x","clock":55106393253,"price_dollars":"0.9600",
                        "delta_fp":"-54.00","side":"no","ts":"2026-11-05T17:26:45.983Z","ts_ms":1793899605983}}"#,
         );
-        let Decoded::Book(book) = frame.msg else { panic!() };
+        let Decoded::Book(book) = frame.msg else {
+            panic!()
+        };
         assert_eq!(book.exchange_ts, Some(1_793_899_605_983_000));
         assert_eq!(
             book.body,
-            BookBody::Level { side: Side::Sell, price: 960_000, change: LevelChange::Delta(-54_000_000) }
+            BookBody::Level {
+                side: Side::Sell,
+                price: 960_000,
+                change: LevelChange::Delta(-54_000_000)
+            }
         );
     }
 
@@ -504,12 +565,22 @@ mod tests {
 
     #[test]
     fn control_frames() {
-        let subscribed = decode_one(r#"{"id":1,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":7}}"#);
+        let subscribed = decode_one(
+            r#"{"id":1,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":7}}"#,
+        );
         assert_eq!(subscribed.msg, Decoded::Subscribed { req_id: 1, sid: 7 });
-        let ok = decode_one(r#"{"id":4,"type":"ok","sid":7,"seq":12,"msg":{"market_tickers":["A"]}}"#);
+        let ok =
+            decode_one(r#"{"id":4,"type":"ok","sid":7,"seq":12,"msg":{"market_tickers":["A"]}}"#);
         assert_eq!(ok.msg, Decoded::Ack { req_id: 4 });
         let error = decode_one(r#"{"id":5,"type":"error","msg":{"code":26,"msg":"limit"}}"#);
-        assert_eq!(error.msg, Decoded::Error { req_id: Some(5), code: 26, message: "limit".into() });
+        assert_eq!(
+            error.msg,
+            Decoded::Error {
+                req_id: Some(5),
+                code: 26,
+                message: "limit".into()
+            }
+        );
         let lifecycle = decode_one(
             r#"{"type":"market_lifecycle_v2","sid":13,"seq":3,"msg":{"market_ticker":"INXD-B4487",
                 "event_type":"created","open_ts":1694635200,"close_ts":1694721600}}"#,
@@ -517,7 +588,10 @@ mod tests {
         assert_eq!(lifecycle.seq, Some((13, 3)));
         assert_eq!(
             lifecycle.msg,
-            Decoded::Lifecycle(Lifecycle::Opened { market: "INXD-B4487".into(), open_at: Some(1_694_635_200) })
+            Decoded::Lifecycle(Lifecycle::Opened {
+                market: "INXD-B4487".into(),
+                open_at: Some(1_694_635_200)
+            })
         );
     }
 
@@ -540,7 +614,10 @@ mod tests {
                 }
             }
         }
-        assert!(snapshots > 0 && deltas > 0, "{snapshots} snapshots, {deltas} deltas");
+        assert!(
+            snapshots > 0 && deltas > 0,
+            "{snapshots} snapshots, {deltas} deltas"
+        );
     }
 
     #[test]
@@ -550,7 +627,9 @@ mod tests {
         let public = key.verifying_key();
         let text = "1700000000000GET/trade-api/ws/v2";
         let encoded = Signer::Ed25519(key).sign(text);
-        let raw = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
         let signature = ed25519_dalek::Signature::from_slice(&raw).unwrap();
         assert!(public.verify(text.as_bytes(), &signature).is_ok());
     }
@@ -562,7 +641,9 @@ mod tests {
         let public = rsa::pss::VerifyingKey::<rsa::sha2::Sha256>::new(private.to_public_key());
         let text = "1700000000000GET/trade-api/ws/v2";
         let encoded = Signer::Rsa(rsa::pss::BlindedSigningKey::new(private)).sign(text);
-        let raw = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
         let signature = rsa::pss::Signature::try_from(raw.as_slice()).unwrap();
         assert!(public.verify(text.as_bytes(), &signature).is_ok());
     }
