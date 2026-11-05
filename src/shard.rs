@@ -1,0 +1,632 @@
+//! A shard: a group of markets carried by `redundancy` connections, plus the
+//! logic that decides which copy of each book is published.
+//!
+//! Every connection keeps its own copy ("view") of every book in the shard.
+//! Per market, one view is the *source*: its changes go to the output. The
+//! shard switches source, and writes a full snapshot of the new source's book
+//! so readers can't inherit the old copy's errors, when:
+//!
+//! - the source socket drops or loses frames (failover), or
+//! - another copy has seen a change (matched by the venue's per-market
+//!   `clock`) that the source still hasn't seen after `lag_threshold`.
+//!
+//! The rest is checking. Every few seconds a few books per connection are
+//! re-requested from the venue and compared level by level with the copy we
+//! built from deltas (the audit probe). A copy that goes quiet while another
+//! copy of the same market keeps changing is resubscribed.
+
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use indexmap::IndexMap;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+
+use crate::book::Book;
+use crate::conn::{self, ConnCmd, ConnEventKind, ConnHandle, ConnSpec, Mode};
+use crate::model::{BookBody, BookMsg, Micros, now_micros, to_datetime};
+use crate::stats::Stats;
+use crate::util::dtos::challenge_orderbook::{
+    PriceLevelUpdateDomain, SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain,
+};
+use crate::venue::Venue;
+use crate::writer::OutMsg;
+
+/// How many recent changes per market to remember for the arrival race.
+const ARRIVALS_KEPT: usize = 16;
+/// A market counts as active if it changed at least this often in the last
+/// activity window.
+const ACTIVE_UPDATES: u32 = 10;
+
+#[derive(Debug, Clone)]
+pub struct ShardConfig {
+    pub redundancy: usize,
+    pub lag_threshold: Duration,
+    pub probe_every: Duration,
+    pub probe_batch: usize,
+    pub quiet_after: Duration,
+    pub recycle_every: Option<Duration>,
+}
+
+#[derive(Debug)]
+pub enum ShardCmd {
+    Add(Vec<String>),
+    Remove(Vec<String>),
+    /// Write a full snapshot of every book.
+    SnapshotAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotReason {
+    /// The venue sent a snapshot for the source copy (first, or a resync).
+    Exchange,
+    /// The source copy became unusable; another copy took over.
+    Failover,
+    /// The source fell behind another copy.
+    Lag,
+    /// The minute snapshot.
+    Periodic,
+}
+
+struct View {
+    book: Book,
+    /// False until this copy has a snapshot, and again after it loses data.
+    valid: bool,
+    clock: u64,
+    exchange_ts: Option<Micros>,
+    /// When this copy last changed (or became valid).
+    last_change: Option<Instant>,
+    probe_pending: bool,
+}
+
+impl View {
+    fn new() -> Self {
+        Self { book: Book::default(), valid: false, clock: 0, exchange_ts: None, last_change: None, probe_pending: false }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Lag {
+    slot: usize,
+    clock: u64,
+    since: Instant,
+}
+
+struct Market {
+    views: Vec<View>,
+    source: Option<usize>,
+    lag: Option<Lag>,
+    /// Recent changes seen on one route but not yet on the others.
+    arrivals: VecDeque<(u64, usize, Micros)>,
+    updates_this_window: u32,
+    updates_last_window: u32,
+    last_quiet_probe: Option<Instant>,
+}
+
+impl Market {
+    fn new(redundancy: usize) -> Self {
+        Self {
+            views: (0..redundancy).map(|_| View::new()).collect(),
+            source: None,
+            lag: None,
+            arrivals: VecDeque::new(),
+            updates_this_window: 0,
+            updates_last_window: 0,
+            last_quiet_probe: None,
+        }
+    }
+}
+
+/// The shard's decisions, kept free of I/O so they can be tested directly.
+/// Output goes to `out`, commands for connections to `cmds`.
+pub struct ShardCore {
+    redundancy: usize,
+    lag_threshold: Duration,
+    quiet_after: Duration,
+    markets: IndexMap<String, Market>,
+    lagging: HashSet<String>,
+    up: Vec<bool>,
+    pub out: Vec<OutMsg>,
+    pub cmds: Vec<(usize, ConnCmd)>,
+    stats: Arc<Stats>,
+}
+
+impl ShardCore {
+    pub fn new(redundancy: usize, lag_threshold: Duration, quiet_after: Duration, stats: Arc<Stats>) -> Self {
+        Self {
+            redundancy,
+            lag_threshold,
+            quiet_after,
+            markets: IndexMap::new(),
+            lagging: HashSet::new(),
+            up: vec![false; redundancy],
+            out: Vec::new(),
+            cmds: Vec::new(),
+            stats,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.markets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.markets.is_empty()
+    }
+
+    pub fn is_up(&self, slot: usize) -> bool {
+        self.up[slot]
+    }
+
+    /// Starts tracking markets; returns the ones that were new.
+    pub fn add(&mut self, markets: Vec<String>) -> Vec<String> {
+        let redundancy = self.redundancy;
+        markets
+            .into_iter()
+            .filter(|m| {
+                if self.markets.contains_key(m) {
+                    return false;
+                }
+                self.markets.insert(m.clone(), Market::new(redundancy));
+                true
+            })
+            .collect()
+    }
+
+    /// Stops tracking markets; returns the ones that were tracked.
+    pub fn remove(&mut self, markets: Vec<String>) -> Vec<String> {
+        markets
+            .into_iter()
+            .filter(|m| {
+                self.lagging.remove(m);
+                self.markets.swap_remove(m).is_some()
+            })
+            .collect()
+    }
+
+    pub fn conn_up(&mut self, slot: usize) {
+        self.up[slot] = true;
+    }
+
+    /// The socket in `slot` went down (`down`) or lost frames: every copy it
+    /// carried is stale until the venue snapshots it again.
+    pub fn conn_lost(&mut self, slot: usize, down: bool, now: Micros) {
+        if down {
+            self.up[slot] = false;
+        }
+        let Self { markets, lagging, out, stats, .. } = self;
+        for (symbol, market) in markets.iter_mut() {
+            let view = &mut market.views[slot];
+            view.valid = false;
+            view.probe_pending = false;
+            if market.lag.is_some_and(|lag| lag.slot == slot) {
+                market.lag = None;
+                lagging.remove(symbol);
+            }
+            if market.source == Some(slot) {
+                reselect(symbol, market, now, out, stats);
+            }
+        }
+    }
+
+    pub fn on_book(&mut self, slot: usize, received: Micros, now: Instant, msg: BookMsg) {
+        let Self { markets, lagging, out, cmds, stats, .. } = self;
+        let Some((_, symbol, market)) = markets.get_full_mut(&msg.market) else {
+            return; // removed while frames were in flight
+        };
+        match msg.body {
+            BookBody::Snapshot { bids, asks } => {
+                stats.snapshots_in.inc();
+                let book = Book::from_levels(bids, asks);
+                let view = &mut market.views[slot];
+                if std::mem::take(&mut view.probe_pending) && view.valid {
+                    stats.probes.inc();
+                    if view.book != book {
+                        stats.probe_mismatches.inc();
+                        tracing::warn!(market = %symbol, slot, clock = ?msg.clock,
+                            ours = view.book.level_count(), venue = book.level_count(),
+                            "audit probe: our copy differed from the venue's book");
+                    }
+                }
+                let changed = !view.valid || view.book != book;
+                if !view.valid {
+                    view.last_change = Some(now);
+                }
+                view.book = book;
+                view.valid = true;
+                view.clock = msg.clock.unwrap_or(view.clock);
+                view.exchange_ts = msg.exchange_ts.or(view.exchange_ts);
+                match market.source {
+                    Some(source) if source == slot => {
+                        if changed {
+                            emit_snapshot(out, stats, symbol, &market.views[slot], received, SnapshotReason::Exchange);
+                        }
+                    }
+                    Some(source) if market.views[source].valid => {}
+                    _ => {
+                        market.source = Some(slot);
+                        emit_snapshot(out, stats, symbol, &market.views[slot], received, SnapshotReason::Exchange);
+                    }
+                }
+            }
+            BookBody::Level { side, price, change } => {
+                stats.deltas_in.inc();
+                let view = &mut market.views[slot];
+                if !view.valid {
+                    stats.stale_deltas.inc();
+                    return;
+                }
+                let quantity = match view.book.apply(side, price, change) {
+                    Ok(quantity) => quantity,
+                    Err(error) => {
+                        stats.negative_levels.inc();
+                        tracing::warn!(market = %symbol, slot, %error, "copy lost data; re-snapshotting it");
+                        view.valid = false;
+                        cmds.push((slot, ConnCmd::Snapshots(vec![symbol.clone()])));
+                        if market.source == Some(slot) {
+                            reselect(symbol, market, received, out, stats);
+                        }
+                        return;
+                    }
+                };
+                if let Some(clock) = msg.clock {
+                    view.clock = clock;
+                }
+                view.exchange_ts = msg.exchange_ts.or(view.exchange_ts);
+                view.last_change = Some(now);
+                if let Some(clock) = msg.clock {
+                    race(market, slot, clock, received, stats);
+                }
+                if market.source == Some(slot) {
+                    market.updates_this_window += 1;
+                    stats.updates_out.inc();
+                    out.push(OutMsg::Update(PriceLevelUpdateDomain {
+                        backtest_timestamp: to_datetime(received),
+                        exchange_timestamp: to_datetime(market.views[slot].exchange_ts.unwrap_or(received)),
+                        price_level: price,
+                        quantity,
+                        side,
+                        symbol: symbol.clone(),
+                    }));
+                    if let (Some(lag), Some(clock)) = (market.lag, msg.clock) {
+                        if clock >= lag.clock {
+                            market.lag = None;
+                            lagging.remove(symbol);
+                        }
+                    }
+                } else if let (Some(source), Some(clock)) = (market.source, msg.clock) {
+                    let source_view = &market.views[source];
+                    if market.lag.is_none() && source_view.valid && clock > source_view.clock {
+                        market.lag = Some(Lag { slot, clock, since: now });
+                        lagging.insert(symbol.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Switches markets whose source has trailed another copy for longer
+    /// than the threshold.
+    pub fn check_lags(&mut self, now: Instant, now_us: Micros) {
+        let due: Vec<String> = self.lagging.iter().cloned().collect();
+        for symbol in due {
+            let Some(market) = self.markets.get_mut(&symbol) else {
+                self.lagging.remove(&symbol);
+                continue;
+            };
+            let Some(lag) = market.lag else {
+                self.lagging.remove(&symbol);
+                continue;
+            };
+            if now.duration_since(lag.since) < self.lag_threshold {
+                continue;
+            }
+            market.lag = None;
+            self.lagging.remove(&symbol);
+            let behind = market.source.is_some_and(|s| market.views[s].clock < lag.clock);
+            if behind && market.views[lag.slot].valid {
+                tracing::info!(market = %symbol, from = ?market.source, to = lag.slot,
+                    "source fell behind another copy; switching");
+                market.source = Some(lag.slot);
+                emit_snapshot(&mut self.out, &self.stats, &symbol, &market.views[lag.slot], now_us, SnapshotReason::Lag);
+            }
+        }
+    }
+
+    /// The minute snapshot: every book with a usable source copy.
+    pub fn snapshot_all(&mut self, now: Micros) {
+        let Self { markets, out, stats, .. } = self;
+        for (symbol, market) in markets.iter() {
+            match market.source {
+                Some(source) if market.views[source].valid => {
+                    emit_snapshot(out, stats, symbol, &market.views[source], now, SnapshotReason::Periodic);
+                }
+                _ => stats.uncovered.inc(),
+            }
+        }
+    }
+
+    /// Picks up to `n` random markets whose copy on `slot` to audit against
+    /// a fresh venue snapshot.
+    pub fn pick_probes(&mut self, slot: usize, n: usize) -> Vec<String> {
+        let mut picked = Vec::new();
+        if self.markets.is_empty() {
+            return picked;
+        }
+        for _ in 0..n * 4 {
+            if picked.len() >= n {
+                break;
+            }
+            let index = fastrand::usize(..self.markets.len());
+            let (symbol, market) = self.markets.get_index_mut(index).expect("index in range");
+            let view = &mut market.views[slot];
+            if view.valid && !view.probe_pending {
+                view.probe_pending = true;
+                picked.push(symbol.clone());
+            }
+        }
+        picked
+    }
+
+    /// Looks for copies that stopped receiving a market's changes.
+    ///
+    /// - A copy that has been silent for `quiet_after` while another copy of
+    ///   the same market changed in that time has lost the market: it is
+    ///   resubscribed on that connection.
+    /// - An active market whose copies have all gone silent is probed; if it
+    ///   is just quiet the probe matches and nothing changes.
+    pub fn check_quiet(&mut self, now: Instant, now_us: Micros) {
+        let Self { markets, up, out, cmds, stats, quiet_after, lagging, .. } = self;
+        let quiet_after = *quiet_after;
+        for (symbol, market) in markets.iter_mut() {
+            let newest = market.views.iter().filter(|v| v.valid).filter_map(|v| v.last_change).max();
+            let Some(newest) = newest else { continue };
+            let mut resubscribed = false;
+            for slot in 0..market.views.len() {
+                let view = &market.views[slot];
+                if !up[slot] || !view.valid {
+                    continue;
+                }
+                let behind = view.last_change.map_or(true, |t| newest.duration_since(t) > quiet_after);
+                if behind && now.duration_since(newest) < quiet_after {
+                    stats.quiet_resubscribes.inc();
+                    tracing::warn!(market = %symbol, slot, "copy went quiet while another kept changing; resubscribing");
+                    market.views[slot].valid = false;
+                    if market.lag.is_some_and(|lag| lag.slot == slot) {
+                        market.lag = None;
+                        lagging.remove(symbol);
+                    }
+                    cmds.push((slot, ConnCmd::Resubscribe(vec![symbol.clone()])));
+                    if market.source == Some(slot) {
+                        reselect(symbol, market, now_us, out, stats);
+                    }
+                    resubscribed = true;
+                }
+            }
+            let silent = now.duration_since(newest) > quiet_after;
+            let was_active = market.updates_last_window >= ACTIVE_UPDATES;
+            let probed_recently = market.last_quiet_probe.is_some_and(|t| now.duration_since(t) < quiet_after);
+            if !resubscribed && silent && was_active && !probed_recently {
+                market.last_quiet_probe = Some(now);
+                for slot in 0..market.views.len() {
+                    let view = &mut market.views[slot];
+                    if up[slot] && view.valid && !view.probe_pending {
+                        view.probe_pending = true;
+                        cmds.push((slot, ConnCmd::Snapshots(vec![symbol.clone()])));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Starts a new activity window (see [`ACTIVE_UPDATES`]).
+    pub fn roll_activity_window(&mut self) {
+        for market in self.markets.values_mut() {
+            market.updates_last_window = std::mem::take(&mut market.updates_this_window);
+        }
+    }
+
+    /// Share of markets whose copy on `slot` is usable.
+    pub fn valid_share(&self, slot: usize) -> f64 {
+        if self.markets.is_empty() {
+            return 1.0;
+        }
+        let valid = self.markets.values().filter(|m| m.views[slot].valid).count();
+        valid as f64 / self.markets.len() as f64
+    }
+
+    /// The venue refused these markets on `slot`; forget that copy.
+    pub fn refused(&mut self, slot: usize, markets: &[String], now: Micros) {
+        let Self { markets: tracked, out, stats, .. } = self;
+        for symbol in markets {
+            if let Some(market) = tracked.get_mut(symbol) {
+                market.views[slot].valid = false;
+                if market.source == Some(slot) {
+                    reselect(symbol, market, now, out, stats);
+                }
+            }
+        }
+    }
+}
+
+/// The source copy is unusable: hand over to the freshest usable copy, or
+/// stop publishing the market until one exists.
+fn reselect(symbol: &str, market: &mut Market, now: Micros, out: &mut Vec<OutMsg>, stats: &Stats) {
+    let best = (0..market.views.len())
+        .filter(|&slot| Some(slot) != market.source && market.views[slot].valid)
+        .max_by_key(|&slot| (market.views[slot].clock, std::cmp::Reverse(slot)));
+    market.source = best;
+    market.lag = None;
+    match best {
+        Some(slot) => emit_snapshot(out, stats, symbol, &market.views[slot], now, SnapshotReason::Failover),
+        None => stats.uncovered.inc(),
+    }
+}
+
+/// Records which route delivered a change first, and by how much.
+fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats) {
+    if let Some(i) = market.arrivals.iter().position(|&(c, s, _)| c == clock && s != slot) {
+        let (_, first_slot, first_at) = market.arrivals.remove(i).expect("position is valid");
+        let route = stats.route(first_slot);
+        route.first_arrivals.inc();
+        route.lead.record(at - first_at);
+    } else {
+        market.arrivals.push_back((clock, slot, at));
+        if market.arrivals.len() > ARRIVALS_KEPT {
+            market.arrivals.pop_front();
+        }
+    }
+}
+
+fn emit_snapshot(out: &mut Vec<OutMsg>, stats: &Stats, symbol: &str, view: &View, at: Micros, reason: SnapshotReason) {
+    match reason {
+        SnapshotReason::Exchange => stats.snapshots_out_exchange.inc(),
+        SnapshotReason::Failover => stats.snapshots_out_failover.inc(),
+        SnapshotReason::Lag => stats.snapshots_out_lag.inc(),
+        SnapshotReason::Periodic => stats.snapshots_out_periodic.inc(),
+    }
+    out.push(OutMsg::Snapshot(SnapshotDomain {
+        received_at: to_datetime(at),
+        exchange_timestamp: to_datetime(view.exchange_ts.unwrap_or(at)),
+        bids: view.book.bids().map(|(price_level, quantity)| SnapshotBidsEntryDomain { price_level, quantity }).collect(),
+        asks: view.book.asks().map(|(price_level, quantity)| SnapshotAsksEntryDomain { price_level, quantity }).collect(),
+        symbol: symbol.to_owned(),
+    }));
+}
+
+pub struct ShardHandle {
+    pub cmds: mpsc::UnboundedSender<ShardCmd>,
+    pub task: JoinHandle<()>,
+}
+
+pub fn spawn<V: Venue>(
+    id: usize,
+    venue: Arc<V>,
+    cfg: ShardConfig,
+    out: crossbeam::channel::Sender<OutMsg>,
+    stats: Arc<Stats>,
+    shutdown: watch::Receiver<bool>,
+) -> ShardHandle {
+    let (cmds, cmds_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run(id, venue, cfg, cmds_rx, out, stats, shutdown));
+    ShardHandle { cmds, task }
+}
+
+fn jittered(period: Duration) -> Duration {
+    // ±20% so a shard's sockets, and different shards, recycle at different times.
+    period.mul_f64(0.8 + 0.4 * fastrand::f64())
+}
+
+async fn run<V: Venue>(
+    id: usize,
+    venue: Arc<V>,
+    cfg: ShardConfig,
+    mut cmds: mpsc::UnboundedReceiver<ShardCmd>,
+    out: crossbeam::channel::Sender<OutMsg>,
+    stats: Arc<Stats>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let urls = venue.ws_urls().to_vec();
+    let conns: Vec<ConnHandle> = (0..cfg.redundancy)
+        .map(|slot| {
+            let spec = ConnSpec {
+                label: format!("s{id}/{slot}"),
+                slot,
+                url: urls[slot % urls.len()].clone(),
+                mode: Mode::Books,
+            };
+            conn::spawn(venue.clone(), spec, Vec::new(), events_tx.clone(), stats.clone(), shutdown.clone())
+        })
+        .collect();
+    drop(events_tx);
+    stats.sockets.add(cfg.redundancy as i64);
+
+    let mut core = ShardCore::new(cfg.redundancy, cfg.lag_threshold, cfg.quiet_after, stats.clone());
+    let mut next_recycle: Vec<Option<Instant>> = vec![None; cfg.redundancy];
+    let mut lag_timer = tokio::time::interval(Duration::from_millis(100));
+    let mut probe_timer = tokio::time::interval(cfg.probe_every);
+    let mut quiet_timer = tokio::time::interval(Duration::from_secs(5));
+    let mut window_timer = tokio::time::interval(Duration::from_secs(300));
+    let mut recycle_timer = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            cmd = cmds.recv() => match cmd {
+                Some(ShardCmd::Add(markets)) => {
+                    let new = core.add(markets);
+                    if !new.is_empty() {
+                        for conn in &conns {
+                            let _ = conn.cmds.send(ConnCmd::Add(new.clone()));
+                        }
+                    }
+                }
+                Some(ShardCmd::Remove(markets)) => {
+                    let gone = core.remove(markets);
+                    if !gone.is_empty() {
+                        for conn in &conns {
+                            let _ = conn.cmds.send(ConnCmd::Remove(gone.clone()));
+                        }
+                    }
+                }
+                Some(ShardCmd::SnapshotAll) => core.snapshot_all(now_micros()),
+                None => break,
+            },
+            Some(event) = events.recv() => match event.kind {
+                ConnEventKind::Up => {
+                    core.conn_up(event.slot);
+                    next_recycle[event.slot] = cfg.recycle_every.map(|p| Instant::now() + jittered(p));
+                }
+                ConnEventKind::Down { .. } => core.conn_lost(event.slot, true, now_micros()),
+                ConnEventKind::Gap => core.conn_lost(event.slot, false, now_micros()),
+                ConnEventKind::Book { received, msg } => core.on_book(event.slot, received, Instant::now(), msg),
+                ConnEventKind::Refused { markets, .. } => core.refused(event.slot, &markets, now_micros()),
+                ConnEventKind::Lifecycle(_) => {}
+            },
+            _ = lag_timer.tick() => core.check_lags(Instant::now(), now_micros()),
+            _ = probe_timer.tick() => {
+                for slot in 0..cfg.redundancy {
+                    if core.is_up(slot) {
+                        let picked = core.pick_probes(slot, cfg.probe_batch);
+                        if !picked.is_empty() {
+                            let _ = conns[slot].cmds.send(ConnCmd::Snapshots(picked));
+                        }
+                    }
+                }
+            }
+            _ = quiet_timer.tick() => core.check_quiet(Instant::now(), now_micros()),
+            _ = window_timer.tick() => core.roll_activity_window(),
+            _ = recycle_timer.tick() => {
+                // Recycle one socket at a time, and only while every other
+                // copy in the shard is up and current.
+                let now = Instant::now();
+                let due = (0..cfg.redundancy).find(|&slot| next_recycle[slot].is_some_and(|t| now >= t));
+                if let Some(slot) = due {
+                    let others_ready = (0..cfg.redundancy)
+                        .filter(|&other| other != slot)
+                        .all(|other| core.is_up(other) && core.valid_share(other) > 0.99);
+                    if others_ready && cfg.redundancy > 1 {
+                        tracing::info!(shard = id, slot, "planned socket recycle");
+                        next_recycle[slot] = None;
+                        let _ = conns[slot].cmds.send(ConnCmd::Reconnect);
+                    }
+                }
+            }
+        }
+        for msg in core.out.drain(..) {
+            let _ = out.send(msg);
+        }
+        for (slot, cmd) in core.cmds.drain(..) {
+            let _ = conns[slot].cmds.send(cmd);
+        }
+    }
+    for conn in conns {
+        let _ = conn.task.await;
+    }
+    stats.sockets.add(-(cfg.redundancy as i64));
+}
+
+#[cfg(test)]
+mod tests;
