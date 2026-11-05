@@ -288,7 +288,10 @@ impl<V: Venue> Conn<V> {
                     };
                     let text = match message {
                         Message::Text(text) => text,
-                        Message::Close(frame) => bail!("server sent close: {frame:?}"),
+                        Message::Close(frame) => {
+                            self.stats.server_closes.inc();
+                            bail!("server sent close: {frame:?}");
+                        }
                         _ => continue, // pings are answered by tungstenite
                     };
                     let route = self.stats.route(self.spec.slot);
@@ -420,6 +423,7 @@ impl<V: Venue> Conn<V> {
         }
         match failed.command {
             _ if code == ERROR_RATE_LIMITED => {
+                self.stats.rate_limited.inc();
                 session.queue.push_front(failed.command);
                 session.not_before = Instant::now() + RATE_LIMIT_PAUSE;
             }
@@ -457,6 +461,9 @@ impl<V: Venue> Conn<V> {
         }
         if !session.subscribe_sent {
             return Ok(());
+        }
+        if !self.venue.snapshots_in_place() {
+            bail!("data lost and the venue can't re-snapshot in place; reconnecting");
         }
         let all: Vec<String> = self.desired.iter().cloned().collect();
         session.queue.retain(|c| !matches!(c, Command::Snapshots(_)));

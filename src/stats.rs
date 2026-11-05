@@ -42,19 +42,22 @@ impl Gauge {
     }
 }
 
-/// Microsecond latency histogram (1 µs to 1 hour, 3 significant digits).
+fn histogram() -> Histogram<u64> {
+    Histogram::new_with_bounds(1, 3_600_000_000, 3).expect("valid bounds")
+}
+
+/// Microsecond latency histogram (1 µs to 1 hour, 3 significant digits),
+/// for the whole run and for the current status-line window.
 pub struct Latency {
     hist: Mutex<Histogram<u64>>,
+    window: Mutex<Histogram<u64>>,
     /// Samples below zero: the exchange's clock is ahead of ours.
     negative: Counter,
 }
 
 impl Default for Latency {
     fn default() -> Self {
-        Self {
-            hist: Mutex::new(Histogram::new_with_bounds(1, 3_600_000_000, 3).expect("valid bounds")),
-            negative: Counter::default(),
-        }
+        Self { hist: Mutex::new(histogram()), window: Mutex::new(histogram()), negative: Counter::default() }
     }
 }
 
@@ -63,8 +66,24 @@ impl Latency {
         if micros < 0 {
             self.negative.inc();
         }
-        let mut hist = self.hist.lock().unwrap_or_else(|e| e.into_inner());
-        hist.saturating_record(micros.max(1) as u64);
+        let value = micros.max(1) as u64;
+        self.hist.lock().unwrap_or_else(|e| e.into_inner()).saturating_record(value);
+        self.window.lock().unwrap_or_else(|e| e.into_inner()).saturating_record(value);
+    }
+
+    /// p50 and p99 (ms) since the last call, then starts a new window.
+    pub fn take_window(&self) -> (Option<f64>, Option<f64>) {
+        let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        let result = if window.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(window.value_at_quantile(0.5) as f64 / 1_000.0),
+                Some(window.value_at_quantile(0.99) as f64 / 1_000.0),
+            )
+        };
+        window.reset();
+        result
     }
 
     pub fn count(&self) -> u64 {
@@ -133,6 +152,9 @@ pub struct Stats {
     pub probes: Counter,
     pub probe_mismatches: Counter,
     pub quiet_resubscribes: Counter,
+    pub quiet_reconnects: Counter,
+    pub rate_limited: Counter,
+    pub server_closes: Counter,
 
     pub listings: Counter,
     pub listing_failures: Counter,
@@ -171,6 +193,9 @@ impl Stats {
             probes: Counter::default(),
             probe_mismatches: Counter::default(),
             quiet_resubscribes: Counter::default(),
+            quiet_reconnects: Counter::default(),
+            rate_limited: Counter::default(),
+            server_closes: Counter::default(),
             listings: Counter::default(),
             listing_failures: Counter::default(),
             lifecycle_opened: Counter::default(),
@@ -199,21 +224,19 @@ impl Stats {
         let secs = now.duration_since(prev.at).as_secs_f64().max(1e-9);
         let frames: u64 = self.routes.iter().map(|r| r.frames.get()).sum();
         let rate = |now: u64, then: u64| (now - then) as f64 / secs;
+        let show = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.0}"));
         let delays: Vec<String> = self
             .routes
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                format!(
-                    "r{i} {}/{}ms",
-                    r.delay.quantile_ms(0.5).map_or("-".into(), |v| format!("{v:.0}")),
-                    r.delay.quantile_ms(0.99).map_or("-".into(), |v| format!("{v:.0}"))
-                )
+                let (p50, p99) = r.delay.take_window();
+                format!("r{i} {}/{}ms", show(p50), show(p99))
             })
             .collect();
         let line = format!(
             "markets {} | sockets {}/{} | in {:.0}/s | out {:.0} upd/s | snaps {} | gaps {} | switches {}+{} | \
-             probes {} bad {} | quiet {} | stale {} | queue {} | delay p50/p99 {}",
+             probes {} bad {} | quiet {}+{} | stale {} | queue {} | delay p50/p99 (window) {}",
             self.markets.get(),
             self.sockets_up.get(),
             self.sockets.get(),
@@ -226,6 +249,7 @@ impl Stats {
             self.probes.get(),
             self.probe_mismatches.get(),
             self.quiet_resubscribes.get(),
+            self.quiet_reconnects.get(),
             self.stale_deltas.get(),
             self.writer_queue.get(),
             delays.join(" "),
@@ -262,6 +286,9 @@ impl Stats {
             "audit_probes": self.probes.get(),
             "audit_mismatches": self.probe_mismatches.get(),
             "quiet_resubscribes": self.quiet_resubscribes.get(),
+            "quiet_socket_reconnects": self.quiet_reconnects.get(),
+            "rate_limited_commands": self.rate_limited.get(),
+            "closed_by_server": self.server_closes.get(),
             "listings": self.listings.get(),
             "listing_failures": self.listing_failures.get(),
             "lifecycle_opened": self.lifecycle_opened.get(),

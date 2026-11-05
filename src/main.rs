@@ -1,5 +1,6 @@
-//! Records every live Kalshi order book: price-level deltas plus a full
-//! snapshot every minute, written with the challenge's `AlignedSbeWriter`.
+//! Records every live order book on a venue (Kalshi by default): price-level
+//! deltas plus a full snapshot every minute, written with the challenge's
+//! `AlignedSbeWriter`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,32 +13,41 @@ use engineering_challenge::shard::ShardConfig;
 use engineering_challenge::stats::{Rates, Stats};
 use engineering_challenge::venue::Venue;
 use engineering_challenge::venue::kalshi::{Env, Kalshi, Signer};
+use engineering_challenge::venue::polymarket::Polymarket;
 use engineering_challenge::writer::Writer;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum VenueName {
+    Kalshi,
+    Polymarket,
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    #[arg(long, value_enum, default_value_t = VenueName::Kalshi)]
+    venue: VenueName,
     /// Kalshi environment.
     #[arg(long, value_enum, default_value_t = Env::Prod)]
     env: Env,
     /// Kalshi API key id.
     #[arg(long, env = "KALSHI_KEY_ID", hide_env_values = true)]
-    key_id: String,
+    key_id: Option<String>,
     /// Kalshi private key file (Ed25519 or RSA, PEM).
     #[arg(long, env = "KALSHI_KEY_FILE")]
-    key_file: PathBuf,
+    key_file: Option<PathBuf>,
     /// Output file, or `-` for stdout. Logs always go to stderr.
     #[arg(long, short, default_value = "-")]
     out: String,
-    /// Copies of every book, each on its own socket (spread across Kalshi's
-    /// websocket hosts).
+    /// Copies of every book, each on its own socket (spread across the
+    /// venue's websocket hosts).
     #[arg(long, default_value_t = 2)]
     redundancy: usize,
-    /// Markets per socket.
-    #[arg(long, default_value_t = 3_000)]
-    markets_per_socket: usize,
+    /// Markets per socket [default: 3000 on Kalshi, 500 on Polymarket].
+    #[arg(long)]
+    markets_per_socket: Option<usize>,
     /// Collect at most this many markets (for testing).
     #[arg(long)]
     max_markets: Option<usize>,
@@ -88,19 +98,35 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(args.redundancy >= 1, "--redundancy must be at least 1");
-    let pem = std::fs::read_to_string(&args.key_file)
-        .with_context(|| format!("reading {}", args.key_file.display()))?;
-    let mut venue = Kalshi::new(args.env, args.key_id.clone(), Signer::from_pem(&pem)?)?;
-    if !args.ws_urls.is_empty() {
-        venue = venue.with_ws_urls(args.ws_urls.clone());
+    match args.venue {
+        VenueName::Kalshi => {
+            let key_id = args.key_id.clone().context("Kalshi needs --key-id (or KALSHI_KEY_ID)")?;
+            let key_file = args.key_file.clone().context("Kalshi needs --key-file (or KALSHI_KEY_FILE)")?;
+            let pem = std::fs::read_to_string(&key_file).with_context(|| format!("reading {}", key_file.display()))?;
+            let mut venue = Kalshi::new(args.env, key_id, Signer::from_pem(&pem)?)?;
+            if !args.ws_urls.is_empty() {
+                venue = venue.with_ws_urls(args.ws_urls.clone());
+            }
+            collect(Arc::new(venue), args, 3_000).await
+        }
+        VenueName::Polymarket => {
+            let mut venue = Polymarket::new()?;
+            if !args.ws_urls.is_empty() {
+                venue = venue.with_ws_urls(args.ws_urls.clone());
+            }
+            collect(Arc::new(venue), args, 500).await
+        }
     }
-    let venue = Arc::new(venue);
+}
+
+async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize) -> anyhow::Result<()> {
     let stats = Arc::new(Stats::new(venue.ws_urls()));
     let writer = Writer::start(&args.out, stats.clone())?;
+    let markets_per_socket = args.markets_per_socket.unwrap_or(default_per_socket);
 
-    let probing = args.probe_secs > 0;
+    let probing = args.probe_secs > 0 && venue.snapshots_in_place();
     let config = Config {
-        markets_per_socket: args.markets_per_socket,
+        markets_per_socket,
         max_markets: args.max_markets,
         snapshot_every: Duration::from_secs(args.snapshot_secs.max(1)),
         listing_every: Duration::from_secs(args.listing_secs.max(30)),
@@ -114,7 +140,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         },
     };
     tracing::info!(venue = venue.name(), env = ?args.env, out = %args.out, redundancy = args.redundancy,
-        markets_per_socket = args.markets_per_socket, urls = ?venue.ws_urls(), "starting");
+        markets_per_socket, urls = ?venue.ws_urls(), "starting");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut collector = tokio::spawn(collector::run(venue, config, writer.tx.clone(), stats.clone(), shutdown_rx));

@@ -389,28 +389,17 @@ impl ShardCore {
     /// - An active market whose copies have all gone silent is probed; if it
     ///   is just quiet the probe matches and nothing changes.
     pub fn check_quiet(&mut self, now: Instant, now_us: Micros) {
-        let Self { markets, up, out, cmds, stats, quiet_after, lagging, .. } = self;
+        let Self { markets, up, out, cmds, stats, quiet_after, lagging, redundancy, .. } = self;
         let quiet_after = *quiet_after;
+        let mut quiet: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
+        let mut probes: Vec<Vec<String>> = vec![Vec::new(); *redundancy];
         for (symbol, market) in markets.iter_mut() {
-            let mut resubscribed = false;
+            let mut any_quiet = false;
             for slot in 0..market.views.len() {
                 let view = &market.views[slot];
-                if !up[slot] || !view.valid {
-                    continue;
-                }
-                if view.behind_since.is_some_and(|t| now.duration_since(t) > quiet_after) {
-                    stats.quiet_resubscribes.inc();
-                    tracing::warn!(market = %symbol, slot, "copy went quiet while another kept changing; resubscribing");
-                    market.views[slot].valid = false;
-                    if market.lag.is_some_and(|lag| lag.slot == slot) {
-                        market.lag = None;
-                        lagging.remove(symbol);
-                    }
-                    cmds.push((slot, ConnCmd::Resubscribe(vec![symbol.clone()])));
-                    if market.source == Some(slot) {
-                        reselect(symbol, market, now_us, out, stats);
-                    }
-                    resubscribed = true;
+                if up[slot] && view.valid && view.behind_since.is_some_and(|t| now.duration_since(t) > quiet_after) {
+                    quiet[slot].push(symbol.clone());
+                    any_quiet = true;
                 }
             }
             let newest = market.views.iter().filter(|v| v.valid).filter_map(|v| v.last_delta).max();
@@ -418,15 +407,50 @@ impl ShardCore {
             let silent = now.duration_since(newest) > quiet_after;
             let was_active = market.updates_last_window >= ACTIVE_UPDATES;
             let probed_recently = market.last_quiet_probe.is_some_and(|t| now.duration_since(t) < quiet_after);
-            if !resubscribed && silent && was_active && !probed_recently {
+            if !any_quiet && silent && was_active && !probed_recently {
                 market.last_quiet_probe = Some(now);
                 for slot in 0..market.views.len() {
                     let view = &mut market.views[slot];
                     if up[slot] && view.valid && !view.probe_pending {
                         view.probe_pending = true;
-                        cmds.push((slot, ConnCmd::Snapshots(vec![symbol.clone()])));
+                        probes[slot].push(symbol.clone());
                     }
                 }
+            }
+        }
+
+        // Many quiet copies on one socket means the socket, not the markets,
+        // is the problem: reconnect it once rather than resubscribing each.
+        let socket_limit = (markets.len() / 10).max(50);
+        for (slot, symbols) in quiet.into_iter().enumerate() {
+            if symbols.is_empty() {
+                continue;
+            }
+            if symbols.len() > socket_limit {
+                stats.quiet_reconnects.inc();
+                tracing::warn!(slot, quiet = symbols.len(), "most of this socket's copies went quiet; reconnecting it");
+                cmds.push((slot, ConnCmd::Reconnect));
+                continue;
+            }
+            stats.quiet_resubscribes.add(symbols.len() as u64);
+            tracing::warn!(slot, count = symbols.len(), first = %symbols[0],
+                "copies trailed the other copy's clock for too long; resubscribing them");
+            for symbol in &symbols {
+                let Some(market) = markets.get_mut(symbol) else { continue };
+                market.views[slot].valid = false;
+                if market.lag.is_some_and(|lag| lag.slot == slot) {
+                    market.lag = None;
+                    lagging.remove(symbol);
+                }
+                if market.source == Some(slot) {
+                    reselect(symbol, market, now_us, out, stats);
+                }
+            }
+            cmds.push((slot, ConnCmd::Resubscribe(symbols)));
+        }
+        for (slot, symbols) in probes.into_iter().enumerate() {
+            if !symbols.is_empty() {
+                cmds.push((slot, ConnCmd::Snapshots(symbols)));
             }
         }
     }

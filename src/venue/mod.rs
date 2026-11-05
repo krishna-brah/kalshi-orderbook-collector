@@ -4,6 +4,7 @@
 //! only sees this trait and the neutral types in [`crate::model`].
 
 pub mod kalshi;
+pub mod polymarket;
 
 use std::future::Future;
 use std::time::Duration;
@@ -38,6 +39,12 @@ pub trait Venue: Send + Sync + 'static {
 
     /// Ask for fresh snapshots of markets already subscribed, if the venue can.
     fn request_snapshots(&self, req_id: u64, sid: Option<u64>, markets: &[String]) -> Option<String>;
+
+    /// Whether `request_snapshots` works. Without it there are no audit
+    /// probes, and a socket that lost data reconnects instead.
+    fn snapshots_in_place(&self) -> bool {
+        true
+    }
 
     /// Subscribe to the venue's market-lifecycle feed, if it has one.
     fn subscribe_lifecycle(&self, req_id: u64) -> Option<String>;

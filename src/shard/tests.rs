@@ -220,6 +220,27 @@ fn quiet_markets_are_left_alone_unless_they_used_to_be_active() {
 }
 
 #[test]
+fn when_most_of_a_socket_goes_quiet_the_socket_is_reconnected_instead() {
+    let start = Instant::now();
+    let mut core = synced(start);
+    let markets: Vec<String> = (0..60).map(|i| format!("Q{i}")).collect();
+    core.add(markets.clone());
+    for market in &markets {
+        let snap = |clock| BookMsg { market: market.clone(), ..snapshot(clock, &[(400_000, 1)], &[]) };
+        core.on_book(0, 1, start, snap(5));
+        core.on_book(1, 1, start, snap(5));
+        // Only slot 1 hears about the next change.
+        let change = BookMsg { market: market.clone(), ..delta(6, Side::Buy, 400_000, 1) };
+        core.on_book(1, 2, start, change);
+    }
+    core.cmds.clear();
+    core.check_quiet(start + QUIET + Duration::from_secs(1), 3);
+    assert!(matches!(core.cmds.as_slice(), [(0, ConnCmd::Reconnect)]), "{:?}", core.cmds);
+    assert_eq!(core.stats.quiet_reconnects.get(), 1);
+    assert_eq!(core.stats.quiet_resubscribes.get(), 0);
+}
+
+#[test]
 fn minute_snapshots_cover_every_book_with_a_usable_copy() {
     let now = Instant::now();
     let mut core = synced(now);
