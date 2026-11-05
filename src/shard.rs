@@ -98,6 +98,14 @@ impl View {
     }
 }
 
+/// A change seen on at least one route: when it first arrived, and which
+/// routes (bit per slot) have delivered it so far.
+struct Arrival {
+    clock: u64,
+    at: Micros,
+    seen: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Lag {
     slot: usize,
@@ -110,7 +118,7 @@ struct Market {
     source: Option<usize>,
     lag: Option<Lag>,
     /// Recent changes seen on one route but not yet on the others.
-    arrivals: VecDeque<(u64, usize, Micros)>,
+    arrivals: VecDeque<Arrival>,
     updates_this_window: u32,
     updates_last_window: u32,
     last_quiet_probe: Option<Instant>,
@@ -511,15 +519,23 @@ fn refresh_behind(market: &mut Market, now: Instant) {
     }
 }
 
-/// Records which route delivered a change first, and by how much.
+/// Records which route delivered each change first, and how far behind it
+/// every other route was.
 fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats) {
-    if let Some(i) = market.arrivals.iter().position(|&(c, s, _)| c == clock && s != slot) {
-        let (_, first_slot, first_at) = market.arrivals.remove(i).expect("position is valid");
-        let route = stats.route(first_slot);
-        route.first_arrivals.inc();
-        route.lead.record(at - first_at);
+    let bit = 1u64 << slot.min(63);
+    let all = (1u64 << market.views.len().min(63)) - 1;
+    // Several deltas can share a clock; each copy delivers them in the same
+    // order, so match against the oldest arrival this route hasn't joined.
+    if let Some(i) = market.arrivals.iter().position(|a| a.clock == clock && a.seen & bit == 0) {
+        let arrival = &mut market.arrivals[i];
+        arrival.seen |= bit;
+        stats.route(slot).behind_first.record(at - arrival.at);
+        if arrival.seen == all {
+            market.arrivals.remove(i);
+        }
     } else {
-        market.arrivals.push_back((clock, slot, at));
+        stats.route(slot).first_arrivals.inc();
+        market.arrivals.push_back(Arrival { clock, at, seen: bit });
         if market.arrivals.len() > ARRIVALS_KEPT {
             market.arrivals.pop_front();
         }

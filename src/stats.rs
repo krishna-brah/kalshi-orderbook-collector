@@ -120,8 +120,9 @@ pub struct RouteStats {
     pub delay: Latency,
     /// Book changes that arrived here before any other copy.
     pub first_arrivals: Counter,
-    /// How much earlier, when they did.
-    pub lead: Latency,
+    /// For changes another route delivered first: how far behind this
+    /// route was.
+    pub behind_first: Latency,
 }
 
 pub struct Stats {
@@ -299,7 +300,7 @@ impl Stats {
                 "bytes": r.bytes.get(),
                 "delay_vs_exchange_send_stamp": r.delay.summary(),
                 "first_arrivals": r.first_arrivals.get(),
-                "lead_when_first": r.lead.summary(),
+                "behind_first_route_when_not_first": r.behind_first.summary(),
             })).collect::<Vec<_>>(),
         })
     }

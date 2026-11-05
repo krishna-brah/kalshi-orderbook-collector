@@ -266,7 +266,14 @@ fn the_arrival_race_credits_the_earlier_route() {
     let mut core = synced(now);
     core.on_book(1, 1_000, now, delta(6, Side::Buy, 400_000, 1));
     core.on_book(0, 1_250, now, delta(6, Side::Buy, 400_000, 1));
+    // Two deltas sharing a clock are matched in order, not to each other.
+    core.on_book(0, 2_000, now, delta(7, Side::Buy, 400_000, 1));
+    core.on_book(0, 2_010, now, delta(7, Side::Sell, 600_000, 1));
+    core.on_book(1, 2_500, now, delta(7, Side::Buy, 400_000, 1));
+    core.on_book(1, 2_600, now, delta(7, Side::Sell, 600_000, 1));
     assert_eq!(core.stats.route(1).first_arrivals.get(), 1);
-    assert_eq!(core.stats.route(0).first_arrivals.get(), 0);
-    assert_eq!(core.stats.route(1).lead.quantile_ms(0.5), Some(0.25));
+    assert_eq!(core.stats.route(0).first_arrivals.get(), 2);
+    assert_eq!(core.stats.route(0).behind_first.quantile_ms(0.5), Some(0.25));
+    assert_eq!(core.stats.route(1).behind_first.count(), 2);
+    assert_eq!(core.stats.route(1).behind_first.quantile_ms(1.0), Some(0.59));
 }

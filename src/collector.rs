@@ -25,6 +25,9 @@ use crate::writer::OutMsg;
 pub struct Config {
     pub markets_per_socket: usize,
     pub max_markets: Option<usize>,
+    /// Collect exactly these markets instead of discovering them (for
+    /// experiments). No listings, no lifecycle feed.
+    pub fixed_markets: Option<Vec<String>>,
     pub snapshot_every: Duration,
     pub listing_every: Duration,
     pub shard: ShardConfig,
@@ -137,8 +140,13 @@ pub async fn run<V: Venue>(
         assigned: HashMap::new(),
     };
 
+    let discover = cfg.fixed_markets.is_none();
+    if let Some(markets) = &cfg.fixed_markets {
+        manager.add(markets.clone());
+    }
+
     let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
-    let lifecycle = venue.subscribe_lifecycle(0).map(|_| {
+    let lifecycle = venue.subscribe_lifecycle(0).filter(|_| discover).map(|_| {
         let spec = ConnSpec {
             label: "lifecycle".into(),
             slot: 0,
@@ -170,9 +178,12 @@ pub async fn run<V: Venue>(
     };
     let mut listing_id = 1u64;
     // (id, started, markets seen so far) of the listing in progress.
-    let mut listing: Option<(u64, Instant, HashSet<String>)> = Some((listing_id, Instant::now(), HashSet::new()));
-    start_listing(listing_id);
-    stats.listings.inc();
+    let mut listing: Option<(u64, Instant, HashSet<String>)> = None;
+    if discover {
+        listing = Some((listing_id, Instant::now(), HashSet::new()));
+        start_listing(listing_id);
+        stats.listings.inc();
+    }
 
     let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<String>();
     let mut listing_timer = tokio::time::interval_at(
@@ -257,7 +268,7 @@ pub async fn run<V: Venue>(
                 }
             }
         }
-        if list_now && listing.is_none() {
+        if list_now && listing.is_none() && discover {
             listing_id += 1;
             listing = Some((listing_id, Instant::now(), HashSet::new()));
             start_listing(listing_id);

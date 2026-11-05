@@ -51,6 +51,10 @@ struct Args {
     /// Collect at most this many markets (for testing).
     #[arg(long)]
     max_markets: Option<usize>,
+    /// Collect exactly the markets listed in this file, one per line,
+    /// instead of discovering them (for experiments).
+    #[arg(long)]
+    markets_file: Option<PathBuf>,
     /// Seconds between full snapshots of every book (aligned to the clock).
     #[arg(long, default_value_t = 60)]
     snapshot_secs: u64,
@@ -125,9 +129,22 @@ async fn collect<V: Venue>(venue: Arc<V>, args: Args, default_per_socket: usize)
     let markets_per_socket = args.markets_per_socket.unwrap_or(default_per_socket);
 
     let probing = args.probe_secs > 0 && venue.snapshots_in_place();
+    let fixed_markets = match &args.markets_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+        None => None,
+    };
     let config = Config {
         markets_per_socket,
         max_markets: args.max_markets,
+        fixed_markets,
         snapshot_every: Duration::from_secs(args.snapshot_secs.max(1)),
         listing_every: Duration::from_secs(args.listing_secs.max(30)),
         shard: ShardConfig {

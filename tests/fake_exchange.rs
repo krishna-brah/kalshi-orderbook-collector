@@ -329,6 +329,7 @@ async fn run(faults: [Faults; 2], lag: Duration, quiet: Duration, changes: usize
     let config = Config {
         markets_per_socket: 100,
         max_markets: None,
+        fixed_markets: None,
         snapshot_every: Duration::from_secs(1),
         listing_every: Duration::from_secs(3_600),
         shard: ShardConfig {

@@ -4,7 +4,9 @@
 //! backwards. It also reports how many snapshots matched the book rebuilt
 //! from the preceding updates.
 //!
-//! Usage: check <file> [--json]
+//! Usage: check <file> [--json] [--top N]
+//!
+//! `--top N` also lists the N markets with the most updates.
 
 use std::collections::HashMap;
 
@@ -21,6 +23,7 @@ use serde_json::json;
 struct Market {
     book: Book,
     last_ts: i64,
+    updates: u64,
 }
 
 #[derive(Default)]
@@ -50,9 +53,13 @@ fn valid_price(price: i64) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let path = args.next().context("usage: check <file> [--json]")?;
-    let json_out = args.any(|a| a == "--json");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = args.first().context("usage: check <file> [--json] [--top N]")?.clone();
+    let json_out = args.iter().any(|a| a == "--json");
+    let top: usize = match args.iter().position(|a| a == "--top") {
+        Some(i) => args.get(i + 1).context("--top needs a number")?.parse()?,
+        None => 0,
+    };
 
     let mut reader = AlignedSbeReader::<OrderbookSchema>::open(&path).with_context(|| format!("opening {path}"))?;
     let mut markets: HashMap<String, Market> = HashMap::new();
@@ -114,6 +121,7 @@ fn main() -> anyhow::Result<()> {
                     report.timestamp_regressions += 1;
                 }
                 market.last_ts = market.last_ts.max(ts);
+                market.updates += 1;
                 let side: Side = update.side;
                 let _ = market.book.apply(side, update.price_level, LevelChange::Absolute(update.quantity));
                 if market.book.is_crossed() {
@@ -173,6 +181,14 @@ fn main() -> anyhow::Result<()> {
         );
         println!("receive minus exchange stamp: p50 {:?} ms, p99 {:?} ms", ms(0.5), ms(0.99));
         println!("hard failures: {hard_failures} {}", summary["hard_failures"]);
+    }
+    if top > 0 {
+        let mut busiest: Vec<(&String, u64)> = markets.iter().map(|(s, m)| (s, m.updates)).collect();
+        busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        println!("most updated markets:");
+        for (symbol, updates) in busiest.into_iter().take(top) {
+            println!("{updates}\t{symbol}");
+        }
     }
     anyhow::ensure!(hard_failures == 0, "{hard_failures} hard failures");
     Ok(())
