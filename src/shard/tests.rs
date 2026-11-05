@@ -370,3 +370,20 @@ fn venues_without_in_place_snapshots_get_no_probes_and_resubscribe_repairs() {
     core.check_repairs(start + REPAIR_AFTER + Duration::from_secs(1));
     assert!(matches!(core.cmds.as_slice(), [(0, ConnCmd::Resubscribe(_))]), "{:?}", core.cmds);
 }
+
+#[test]
+fn an_update_is_stamped_when_the_fastest_copy_received_it() {
+    let now = Instant::now();
+    let mut core = synced(now);
+    // Slot 0 publishes, but slot 1 heard about the change 250 µs sooner.
+    core.on_book(1, 1_000, None, now, delta(6, Side::Buy, 400_000, 1));
+    core.on_book(0, 1_250, None, now, delta(6, Side::Buy, 400_000, 1));
+    assert_eq!(update_of(&core.out[0]).backtest_timestamp.timestamp_micros(), 1_000);
+    assert_eq!(core.stats.stamped_from_faster_copy.get(), 1);
+
+    // When the published copy is first, its own time stands.
+    core.out.clear();
+    core.on_book(0, 2_000, None, now, delta(7, Side::Buy, 400_000, 1));
+    core.on_book(1, 2_400, None, now, delta(7, Side::Buy, 400_000, 1));
+    assert_eq!(update_of(&core.out[0]).backtest_timestamp.timestamp_micros(), 2_000);
+}

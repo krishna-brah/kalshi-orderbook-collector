@@ -161,6 +161,8 @@ pub struct Stats {
     /// Messages stamped later than received so a market's timestamps never
     /// go backwards in the file.
     pub stamp_clamps: Counter,
+    /// Updates stamped with another copy's earlier receive time.
+    pub stamped_from_faster_copy: Counter,
 
     pub listings: Counter,
     pub listing_failures: Counter,
@@ -205,6 +207,7 @@ impl Stats {
             repairs: Counter::default(),
             repair_reconnects: Counter::default(),
             stamp_clamps: Counter::default(),
+            stamped_from_faster_copy: Counter::default(),
             listings: Counter::default(),
             listing_failures: Counter::default(),
             lifecycle_opened: Counter::default(),
@@ -301,6 +304,7 @@ impl Stats {
             "copies_repaired": self.repairs.get(),
             "repair_socket_reconnects": self.repair_reconnects.get(),
             "timestamps_held_back": self.stamp_clamps.get(),
+            "updates_stamped_from_faster_copy": self.stamped_from_faster_copy.get(),
             "listings": self.listings.get(),
             "listing_failures": self.listing_failures.get(),
             "lifecycle_opened": self.lifecycle_opened.get(),

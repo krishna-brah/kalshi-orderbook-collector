@@ -340,14 +340,22 @@ impl ShardCore {
                 }
                 view.exchange_ts = msg.exchange_ts.or(view.exchange_ts);
                 view.last_delta = Some(now);
+                // Every copy carries the same change under the same clock, so
+                // the change is stamped with the earliest time any socket
+                // received it: the published copy decides the content, the
+                // fastest copy the time.
+                let mut first_seen = received;
                 if let Some(clock) = msg.clock {
-                    race(market, slot, clock, received, stats);
+                    first_seen = race(market, slot, clock, received, stats);
                     refresh_behind(market, now);
                 }
                 if market.source == Some(slot) {
                     market.updates_this_window += 1;
                     stats.updates_out.inc();
-                    let at = stamp(&mut market.last_out, received, stats);
+                    if first_seen < received {
+                        stats.stamped_from_faster_copy.inc();
+                    }
+                    let at = stamp(&mut market.last_out, first_seen, stats);
                     out.push(OutMsg::Update(PriceLevelUpdateDomain {
                         backtest_timestamp: to_datetime(at),
                         exchange_timestamp: to_datetime(market.views[slot].exchange_ts.unwrap_or(received)),
@@ -642,25 +650,28 @@ fn refresh_behind(market: &mut Market, now: Instant) {
 }
 
 /// Records which route delivered each change first, and how far behind it
-/// every other route was.
-fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats) {
+/// every other route was. Returns when the change first reached any route.
+fn race(market: &mut Market, slot: usize, clock: u64, at: Micros, stats: &Stats) -> Micros {
     let bit = 1u64 << slot.min(63);
     let all = (1u64 << market.views.len().min(63)) - 1;
     // Several deltas can share a clock; each copy delivers them in the same
     // order, so match against the oldest arrival this route hasn't joined.
     if let Some(i) = market.arrivals.iter().position(|a| a.clock == clock && a.seen & bit == 0) {
         let arrival = &mut market.arrivals[i];
+        let first = arrival.at;
         arrival.seen |= bit;
-        stats.route(slot).behind_first.record(at - arrival.at);
+        stats.route(slot).behind_first.record(at - first);
         if arrival.seen == all {
             market.arrivals.remove(i);
         }
+        first.min(at)
     } else {
         stats.route(slot).first_arrivals.inc();
         market.arrivals.push_back(Arrival { clock, at, seen: bit });
         if market.arrivals.len() > ARRIVALS_KEPT {
             market.arrivals.pop_front();
         }
+        at
     }
 }
 
