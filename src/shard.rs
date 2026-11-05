@@ -75,14 +75,26 @@ struct View {
     valid: bool,
     clock: u64,
     exchange_ts: Option<Micros>,
-    /// When this copy last changed (or became valid).
-    last_change: Option<Instant>,
+    /// When this copy last applied a delta. Snapshots don't count: they are
+    /// not evidence that the market moved.
+    last_delta: Option<Instant>,
+    /// Since when another usable copy has held a newer change (higher
+    /// clock) than this one.
+    behind_since: Option<Instant>,
     probe_pending: bool,
 }
 
 impl View {
     fn new() -> Self {
-        Self { book: Book::default(), valid: false, clock: 0, exchange_ts: None, last_change: None, probe_pending: false }
+        Self {
+            book: Book::default(),
+            valid: false,
+            clock: 0,
+            exchange_ts: None,
+            last_delta: None,
+            behind_since: None,
+            probe_pending: false,
+        }
     }
 }
 
@@ -230,13 +242,11 @@ impl ShardCore {
                     }
                 }
                 let changed = !view.valid || view.book != book;
-                if !view.valid {
-                    view.last_change = Some(now);
-                }
                 view.book = book;
                 view.valid = true;
                 view.clock = msg.clock.unwrap_or(view.clock);
                 view.exchange_ts = msg.exchange_ts.or(view.exchange_ts);
+                refresh_behind(market, now);
                 match market.source {
                     Some(source) if source == slot => {
                         if changed {
@@ -274,9 +284,10 @@ impl ShardCore {
                     view.clock = clock;
                 }
                 view.exchange_ts = msg.exchange_ts.or(view.exchange_ts);
-                view.last_change = Some(now);
+                view.last_delta = Some(now);
                 if let Some(clock) = msg.clock {
                     race(market, slot, clock, received, stats);
+                    refresh_behind(market, now);
                 }
                 if market.source == Some(slot) {
                     market.updates_this_window += 1;
@@ -371,25 +382,23 @@ impl ShardCore {
 
     /// Looks for copies that stopped receiving a market's changes.
     ///
-    /// - A copy that has been silent for `quiet_after` while another copy of
-    ///   the same market changed in that time has lost the market: it is
-    ///   resubscribed on that connection.
+    /// - A copy that has trailed another copy's clock for `quiet_after` is
+    ///   missing changes the other copy got: it is resubscribed on its
+    ///   connection. (A briefly trailing source is handled sooner by the lag
+    ///   switch; this also repairs backups.)
     /// - An active market whose copies have all gone silent is probed; if it
     ///   is just quiet the probe matches and nothing changes.
     pub fn check_quiet(&mut self, now: Instant, now_us: Micros) {
         let Self { markets, up, out, cmds, stats, quiet_after, lagging, .. } = self;
         let quiet_after = *quiet_after;
         for (symbol, market) in markets.iter_mut() {
-            let newest = market.views.iter().filter(|v| v.valid).filter_map(|v| v.last_change).max();
-            let Some(newest) = newest else { continue };
             let mut resubscribed = false;
             for slot in 0..market.views.len() {
                 let view = &market.views[slot];
                 if !up[slot] || !view.valid {
                     continue;
                 }
-                let behind = view.last_change.map_or(true, |t| newest.duration_since(t) > quiet_after);
-                if behind && now.duration_since(newest) < quiet_after {
+                if view.behind_since.is_some_and(|t| now.duration_since(t) > quiet_after) {
                     stats.quiet_resubscribes.inc();
                     tracing::warn!(market = %symbol, slot, "copy went quiet while another kept changing; resubscribing");
                     market.views[slot].valid = false;
@@ -404,6 +413,8 @@ impl ShardCore {
                     resubscribed = true;
                 }
             }
+            let newest = market.views.iter().filter(|v| v.valid).filter_map(|v| v.last_delta).max();
+            let Some(newest) = newest else { continue };
             let silent = now.duration_since(newest) > quiet_after;
             let was_active = market.updates_last_window >= ACTIVE_UPDATES;
             let probed_recently = market.last_quiet_probe.is_some_and(|t| now.duration_since(t) < quiet_after);
@@ -461,6 +472,18 @@ fn reselect(symbol: &str, market: &mut Market, now: Micros, out: &mut Vec<OutMsg
     match best {
         Some(slot) => emit_snapshot(out, stats, symbol, &market.views[slot], now, SnapshotReason::Failover),
         None => stats.uncovered.inc(),
+    }
+}
+
+/// Marks which usable copies trail the newest clock any copy has seen.
+fn refresh_behind(market: &mut Market, now: Instant) {
+    let newest = market.views.iter().filter(|v| v.valid).map(|v| v.clock).max().unwrap_or(0);
+    for view in &mut market.views {
+        if !view.valid || view.clock >= newest {
+            view.behind_since = None;
+        } else if view.behind_since.is_none() {
+            view.behind_since = Some(now);
+        }
     }
 }
 
@@ -547,7 +570,8 @@ async fn run<V: Venue>(
     let mut next_recycle: Vec<Option<Instant>> = vec![None; cfg.redundancy];
     let mut lag_timer = tokio::time::interval(Duration::from_millis(100));
     let mut probe_timer = tokio::time::interval(cfg.probe_every);
-    let mut quiet_timer = tokio::time::interval(Duration::from_secs(5));
+    let mut quiet_timer =
+        tokio::time::interval((cfg.quiet_after / 4).clamp(Duration::from_millis(100), Duration::from_secs(5)));
     let mut window_timer = tokio::time::interval(Duration::from_secs(300));
     let mut recycle_timer = tokio::time::interval(Duration::from_secs(10));
 

@@ -176,15 +176,30 @@ fn audit_probes_compare_the_venue_book_with_ours() {
 }
 
 #[test]
-fn a_copy_that_goes_quiet_while_the_other_keeps_changing_is_resubscribed() {
+fn a_copy_that_never_gets_a_change_the_other_copy_got_is_resubscribed() {
     let start = Instant::now();
     let mut core = synced(start);
-    let later = start + QUIET + Duration::from_secs(5);
-    core.on_book(1, 90, later, delta(9, Side::Buy, 400_000, 1));
-    core.check_quiet(later, 91);
+    core.on_book(1, 90, start, delta(9, Side::Buy, 400_000, 1));
+    core.check_quiet(start + QUIET / 2, 91);
+    assert!(core.cmds.is_empty(), "trailing briefly is normal");
+    core.check_quiet(start + QUIET + Duration::from_secs(1), 92);
     assert!(matches!(core.cmds.as_slice(), [(0, ConnCmd::Resubscribe(m))] if m == &["M"]));
     assert_eq!(core.stats.quiet_resubscribes.get(), 1);
     assert_eq!(core.out.len(), 1, "slot 0 was the source, so slot 1 takes over");
+}
+
+#[test]
+fn a_fresh_snapshot_on_one_copy_does_not_make_the_other_look_quiet() {
+    // Regression: counting a resubscribe's snapshot as activity made the
+    // other copy look silent, which resubscribed it, and so on forever.
+    let start = Instant::now();
+    let mut core = synced(start);
+    core.conn_lost(0, false, 1);
+    core.on_book(0, 2, start + QUIET * 2, snapshot(5, &[(400_000, 10)], &[(600_000, 20)]));
+    core.check_quiet(start + QUIET * 2 + Duration::from_secs(1), 3);
+    core.check_quiet(start + QUIET * 4, 4);
+    assert!(core.cmds.is_empty(), "both copies are at the same clock: {:?}", core.cmds);
+    assert_eq!(core.stats.quiet_resubscribes.get(), 0);
 }
 
 #[test]
