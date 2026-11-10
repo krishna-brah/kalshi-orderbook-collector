@@ -99,10 +99,12 @@ either.
 These need a production key and a host in us-east-2 with a disciplined clock
 (AWS Time Sync), which this machine isn't:
 
-- **Route versus distance.** On demo from Austin, CloudFront wins. Its edge
-  is nearby, while demo's load balancer is in Oregon. From inside us-east-2,
-  production's direct load balancer may win instead. The race metric answers
-  this directly, and the per-route counters show it within minutes.
+- **Route versus distance.** On demo from Austin the winner flipped between
+  days: CloudFront, whose edge is nearby, on Nov 5, and the direct load
+  balancer in Oregon on Nov 10, when demo was much busier. From inside
+  us-east-2, production's direct load balancer may win most of the time. The
+  race metric answers this directly, and the per-route counters show it
+  within minutes.
 - **Pick the fastest load-balancer node.** `external-api-ws.kalshi.com` has 8
   addresses. Connect to each explicitly (keeping the hostname for TLS),
   measure the race for a few minutes, and keep the fastest few. This is the
