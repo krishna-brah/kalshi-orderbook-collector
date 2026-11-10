@@ -57,6 +57,17 @@ Austin:
   counts; opening more sockets on the same route buys a little at the tail
   (socket 3's p99 of 12 ms against socket 1's 49 ms), not at the median.
 
+**Which route wins changes from day to day.** A second run on every demo
+market, on Nov 10, with demo about 11 times busier (about 4,400 published
+updates a second, against 395), reversed the Nov 5 result. The direct load
+balancer delivered 980,543 changes first (67%) and CloudFront 478,739.
+Against Kalshi's send stamp, the direct route's median delay was 97 ms (p99
+657 ms) and CloudFront's 155 ms (p99 1.9 s); this machine's clock was within
+about 25 ms of Apple's time servers that day, so those are close to real
+delays. 447 of the run's 491 lag switches moved a market onto the direct
+route. A route can't be picked once and trusted, which is why the collector
+races its copies all the time and switches per market.
+
 **What the collector does with this.** Both copies of a market carry the same
 change under the same `clock`, so each published update is stamped with the
 earliest time *any* socket received it, not just the published copy's time.

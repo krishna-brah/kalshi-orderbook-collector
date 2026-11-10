@@ -194,6 +194,7 @@ Live runs on Kalshi demo, from a Mac mini in Austin:
 
 | Run | Markets | Sockets | Length | Messages written | `check` failures | Audit probes (mismatches) | Sequence gaps |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Every market, final code, written to stdout (Nov 10)³ | 243,005 | 165 | 4 min | 2.06 M | 0 | 25,387 (1) | 0 |
 | Every market, default settings | 254,862 | 171 | 24 min¹ | 5.00 M | 0 | 181,329 (0) | 0 |
 | Every market, after the review fixes² | 256,353 | 171 | 5 min | 1.44 M | 0 | 32,160 (0) | 0 |
 | Every market, recycling every 2 min (stress) | 259,508 | 175 | 7 min | 2.70 M | 0 | 46,278 (0) | 0 |
@@ -211,6 +212,21 @@ updates, a sanity check on the NO-side mapping (the direct check,
 market with NO bids). Every snapshot again matched the replayed book. All of
 that run's updates came from about 400 markets; the other ~256,000 demo
 books never moved.
+
+³ Demo was about 11 times busier than in the Nov 5 five-minute run (about
+4,400 published updates a second, against 395), and the exchange misbehaved
+in the ways the brief describes. 491 markets switched to their other copy
+because the published copy fell more than 0.5 s behind, and 108 copies that
+went a minute without a change the other copy had received were
+resubscribed. One audit probe found a published copy one
+contract off on one price level, with no gap in its socket's sequence
+numbers: one change never reached that copy. The probe's snapshot, arriving
+right behind it, corrected the book, and the market was resubscribed.
+`check --corrections` lists the 490 snapshots that changed the replayed
+book: 487 came within a second of a source switch on the same market, 1 is
+that audit catch, and 2 are Kalshi sending empty books for two markets as
+they closed, which were then unsubscribed. The file compressed 17× with
+zstd.
 
 The live runs caught three bugs, each now fixed and covered by a test:
 
@@ -274,4 +290,5 @@ src/util/              the template's SBE helpers (unchanged)
 tests/fake_exchange.rs end-to-end failure tests
 examples/spike.rs      the throwaway probe that measured per-socket limits
 examples/yes_price_check.rs  live check that use_yes_price changes no book
+examples/dump_market.rs      every message for one market in an output file
 ```

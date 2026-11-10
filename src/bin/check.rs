@@ -4,9 +4,12 @@
 //! backwards. It also reports how many snapshots matched the book rebuilt
 //! from the preceding updates.
 //!
-//! Usage: check <file> [--json] [--top N]
+//! Usage: check <file> [--json] [--top N] [--corrections]
 //!
-//! `--top N` also lists the N markets with the most updates.
+//! `--top N` also lists the N markets with the most updates. `--corrections`
+//! lists every snapshot that changed the replayed book, with its market and
+//! time, so each can be matched with the collector's log: a source switch
+//! writes one by design.
 
 use std::collections::HashMap;
 
@@ -58,9 +61,10 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = args
         .first()
-        .context("usage: check <file> [--json] [--top N]")?
+        .context("usage: check <file> [--json] [--top N] [--corrections]")?
         .clone();
     let json_out = args.iter().any(|a| a == "--json");
+    let list_corrections = args.iter().any(|a| a == "--corrections");
     let top: usize = match args.iter().position(|a| a == "--top") {
         Some(i) => args.get(i + 1).context("--top needs a number")?.parse()?,
         None => 0,
@@ -100,12 +104,15 @@ fn main() -> anyhow::Result<()> {
                     report.malformed_snapshots += 1;
                 }
                 let book = Book::from_levels(bids, asks);
-                let market = markets.entry(snapshot.symbol).or_default();
+                let market = markets.entry(snapshot.symbol.clone()).or_default();
                 if market.last_ts != 0 {
                     if market.book == book {
                         report.snapshots_matching_replay += 1;
                     } else {
                         report.snapshots_correcting_replay += 1;
+                        if list_corrections {
+                            println!("corrected {} at {}", snapshot.symbol, snapshot.received_at);
+                        }
                     }
                 }
                 if ts < market.last_ts {
