@@ -2,6 +2,7 @@
 //! deltas plus a full snapshot every minute, written with the challenge's
 //! `AlignedSbeWriter`.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,6 +98,12 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    // The output is binary, so don't pour it into a terminal.
+    anyhow::ensure!(
+        args.out != "-" || !std::io::stdout().is_terminal(),
+        "stdout is a terminal and the output is binary: redirect it \
+         (`collector > books.sbe`) or pass `--out books.sbe`"
+    );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

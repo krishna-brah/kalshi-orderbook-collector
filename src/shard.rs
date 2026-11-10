@@ -305,10 +305,14 @@ impl ShardCore {
                 if std::mem::take(&mut view.probe_pending) && view.valid {
                     stats.probes.inc();
                     if view.book != book {
+                        // This socket's subscription missed changes. The
+                        // venue's book replaces ours now, and the market is
+                        // resubscribed in case the subscription is broken.
                         stats.probe_mismatches.inc();
                         tracing::warn!(market = %symbol, slot, clock = ?msg.clock,
                             ours = view.book.level_count(), venue = book.level_count(),
-                            "audit probe: our copy differed from the venue's book");
+                            "audit probe: our copy differed from the venue's book; resubscribing it");
+                        cmds.push((slot, ConnCmd::Resubscribe(vec![symbol.clone()])));
                     }
                 }
                 let changed = !view.valid || view.book != book;

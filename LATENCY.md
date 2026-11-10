@@ -2,7 +2,7 @@
 
 Completeness comes first, so nothing here trades a missed update for speed.
 These are measurements from the collector itself. Except where noted, they
-were taken on Kalshi's demo environment from a laptop in Austin, which is far
+were taken on Kalshi's demo environment from a Mac mini in Austin, which is far
 from where a real collector should run.
 
 ## Two ways to measure, and why one is unreliable here
@@ -10,7 +10,7 @@ from where a real collector should run.
 1. **Receive time minus Kalshi's send stamp.** Every frame carries
    `sending_ts_ms`, when Kalshi queued it. Subtracting it from our receive
    time gives a per-socket delay, but it mixes in the difference between our
-   clock and Kalshi's. On this laptop `sntp` put the clock 70–90 ms slow, and
+   clock and Kalshi's. On this machine `sntp` put the clock 70–90 ms slow, and
    many samples came out negative. Treat absolute values from this machine as
    wrong by about that much.
 2. **The arrival race.** This one doesn't depend on clocks. Kalshi gives the
@@ -86,7 +86,7 @@ either.
 ## Experiments to run next
 
 These need a production key and a host in us-east-2 with a disciplined clock
-(AWS Time Sync), which this laptop isn't:
+(AWS Time Sync), which this machine isn't:
 
 - **Route versus distance.** On demo from Austin, CloudFront wins. Its edge
   is nearby, while demo's load balancer is in Oregon. From inside us-east-2,

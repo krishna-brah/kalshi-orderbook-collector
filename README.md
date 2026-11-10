@@ -28,24 +28,41 @@ The core doesn't know which exchange it is talking to: `--venue polymarket`
 runs the same code on Polymarket (Extension 3). [LATENCY.md](LATENCY.md) has
 the latency measurements and experiments (Extension 4).
 
+## The brief, point by point
+
+| The brief asks for | Where |
+| --- | --- |
+| Every live market except MVEs, with a book for each | `venue/kalshi.rs` lists open markets with `mve_filter=exclude`; `book.rs` keeps each book |
+| New markets subscribed, finished ones dropped | Kalshi's lifecycle feed, plus a full listing every 10 minutes (`collector.rs`) |
+| Deltas to stdout plus a full snapshot every minute, through the template's helpers | stdout by default; snapshots on every wall-clock minute; `writer.rs` → `AlignedSbeWriter` (`src/util/` is unchanged) |
+| SIGINT closes the websockets and the file | `main.rs`, `writer.rs` |
+| Markets spread over many websockets | 3,000 markets per socket |
+| Extension 1: redundant websockets, a snapshot on every source switch | `shard.rs` (`ShardCore`) |
+| Extension 2: resubscribe a market that goes too quiet; reconnect sockets periodically | `shard.rs`: quiet checks, audit probes, repair sweep; every socket reconnects every 30 minutes |
+| Extension 3: only the exchange's encoding and decoding change | `venue/`; `--venue polymarket` |
+| Extension 4: latency experiments, written up in markdown | [LATENCY.md](LATENCY.md) |
+
 ## Run it
 
-Needs stable Rust. Kalshi requires an API key even for public data.
+Needs Rust 1.88 or newer (the template's SBE crate requires it). Kalshi
+requires an API key even for public data.
 
 ```bash
 export KALSHI_KEY_ID=<key id>
 export KALSHI_KEY_FILE=<private key file>    # Ed25519 or RSA, PEM
 cargo build --release
 
-./target/release/collector --out books.sbe                            # production
-./target/release/collector --env demo --out - | zstd > books.sbe.zst   # demo, to stdout
+./target/release/collector > books.sbe                  # production, written to stdout
+./target/release/collector --env demo --out books.sbe   # demo, written to a file
 ./target/release/check books.sbe
 ```
 
-`--out -` writes to stdout; logs and a status line every 10 s go to stderr.
+The output goes to stdout unless `--out` names a file. Logs and a status line
+every 10 s go to stderr, and it refuses to write binary to a terminal.
 Ctrl-C (SIGINT) or SIGTERM closes every socket, writes whatever is queued,
 flushes the last chunk and closes the file, then prints a JSON run summary
-(`--summary run.json` keeps a copy).
+(`--summary run.json` keeps a copy). Use a plain redirect rather than a pipe:
+Ctrl-C also stops the next program in a pipe, which can lose the last chunk.
 
 `./target/release/collector --venue polymarket --out pm.sbe` needs no key.
 `collector --help` lists the settings: copies per book, markets per socket,
@@ -120,11 +137,19 @@ lag threshold, probe rate, quiet threshold and recycle interval.
   - Audit probes: every 5 s, 4 random books per socket are re-fetched with
     `get_snapshot`. Kalshi guarantees a snapshot includes every change up to
     its clock and nothing after, and frames on one socket arrive in order, so
-    our copy must match it exactly. Mismatches are counted and the venue's
-    book wins.
-  - A copy that trails the other copy's clock for 60 s is resubscribed. If
-    that is true of most of a socket's copies, the socket is reconnected
-    instead. An active market whose copies all go silent is probed.
+    our copy must match it exactly. A mismatch means that socket's
+    subscription missed changes: it is counted, the venue's book replaces
+    ours, and the market is resubscribed on that socket.
+  - Quiet markets (Extension 2). Activity is counted per market in 5-minute
+    windows, but a plain "too quiet, resubscribe" rule can't tell a quiet
+    market from a broken subscription, and most markets never move (in a
+    5-minute run on demo, all the changes came from about 400 of ~256,000
+    markets), so it would resubscribe almost everything for nothing. Two
+    checks replace it. A copy that trails the other copy's clock for 60 s is
+    resubscribed; if most of a socket's copies do, the socket is reconnected
+    instead. A market that was active (10 or more changes in the last window)
+    and has gone silent on every copy for 60 s is probed: if the venue's book
+    matches ours, the market is just quiet; if not, it is resubscribed.
   - Repair sweep: a copy that stays unusable on a live socket for 15 s,
     whatever the reason (a lost or refused snapshot request, an add that
     never confirmed), is re-requested, then resubscribed; a socket where most
@@ -165,7 +190,7 @@ Tests (`cargo test`, about 6 s):
   output file and requires it to equal the exchange's final books exactly.
   With the lag switch disabled, the two tests that depend on it fail.
 
-Live runs on Kalshi demo, from a laptop in Austin:
+Live runs on Kalshi demo, from a Mac mini in Austin:
 
 | Run | Markets | Sockets | Length | Messages written | `check` failures | Audit probes (mismatches) | Sequence gaps |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -174,7 +199,7 @@ Live runs on Kalshi demo, from a laptop in Austin:
 | Every market, recycling every 2 min (stress) | 259,508 | 175 | 7 min | 2.70 M | 0 | 46,278 (0) | 0 |
 | Polymarket, 2,000 books, after the review fixes | 2,000 | 8 | 2 min | 47,004 | 0 | n/a | n/a |
 
-¹ It ended when the laptop's disk filled, and stopped itself rather than
+¹ It ended when the machine's disk filled, and stopped itself rather than
 keep collecting what it couldn't write; the file holds the first 19
 minutes. All 4.58 million snapshots in it matched the book rebuilt from the
 updates before them. It ran at about 365 MB of memory and under 3% of one
@@ -215,7 +240,7 @@ is scheduled to change.
   (`--env prod`, the default) runs the same code with the same message
   formats, auth and two-host layout, but it has not been run against
   production yet.
-- Timestamps come from the wall clock. On the laptop used here it ran 70–90 ms
+- Timestamps come from the wall clock. On the machine used here it ran 70–90 ms
   slow (`sntp`). A real capture belongs on a host with a disciplined clock
   (chrony, or AWS Time Sync on EC2) near Kalshi; production's load balancer is
   in us-east-2.
@@ -227,7 +252,7 @@ is scheduled to change.
   or power loss loses at most the unflushed chunk.
 - Snapshots of every book every minute dominate the file: about 17 MB a
   minute (1 GB an hour) for the ~255,000 demo markets, most of them empty
-  books. The format compresses well (`--out - | zstd`).
+  books. The file compresses well (zstd, once it is closed).
 - Polymarket has no sequence numbers and no in-place re-snapshot, so there
   lost frames show up only as one copy trailing the other, and there are no
   audit probes.

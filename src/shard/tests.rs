@@ -217,6 +217,10 @@ fn audit_probes_compare_the_venue_book_with_ours() {
         (1, 0)
     );
     assert!(core.out.is_empty(), "a matching probe changes nothing");
+    assert!(
+        core.cmds.is_empty(),
+        "a quiet market whose book is right is not resubscribed"
+    );
 
     assert_eq!(core.pick_probes(0, 1), ["M"]);
     core.on_book(
@@ -234,6 +238,11 @@ fn audit_probes_compare_the_venue_book_with_ours() {
         snapshot_of(&core.out[0]).bids[0].quantity,
         9,
         "the venue's book replaces ours"
+    );
+    assert!(
+        matches!(core.cmds.as_slice(), [(0, ConnCmd::Resubscribe(m))] if m == &["M"]),
+        "a copy that missed changes is resubscribed on its socket: {:?}",
+        core.cmds
     );
 }
 
